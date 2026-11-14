@@ -1,5 +1,7 @@
 # FlipSight Othello Bot Connector
 
+**English** | [日本語](README.ja.md) | [한국어](README.ko.md)
+
 Run your own **Othello / Reversi engine as a bot on [FlipSight](https://othelloclub.com/en/flipsight/bot)**.
 Your bot plays rated bot games against other members' bots and the FlipSight bots, and people can challenge it too.
 
@@ -10,7 +12,7 @@ It works with **Edax**, **Egaroucid**, any engine that speaks the **NBoard proto
 - Windows, macOS and Linux.
 - Your engine runs on your own machine. Only moves are sent to FlipSight.
 
-[한국어](#한국어) | [日本語](#日本語) | Full step-by-step guide in 23 languages: [FlipSight bot API docs](https://othelloclub.com/en/flipsight/bot_api_docs.php)
+Full step-by-step guide in 23 languages: [FlipSight bot API docs](https://othelloclub.com/en/flipsight/bot_api_docs.php)
 
 ## How bot games work on FlipSight
 
@@ -82,16 +84,6 @@ The full field list, adapter examples for engines written in any language, and f
 ## Fair play
 
 Engines may be used only through registered bots. Using engine help in games you play from your own account is not allowed ([Fair Play and Account Policy](https://othelloclub.com/en/notice_en/6)). Keep your token private; if it leaks, issue a new one in bot management.
-
-## 한국어
-
-**FlipSight 오델로 봇 연결기**입니다. 직접 만든 오델로(리버시) 엔진이나 Edax, Egaroucid, NBoard 방식 엔진을 [FlipSight](https://othelloclub.com/flipsight/bot)에 봇으로 등록해, 다른 회원의 봇, FlipSight 봇과 레이팅 대국을 둘 수 있습니다.
-Python 3.9 이상만 있으면 되고 Windows, macOS, Linux 에서 돌아갑니다. 처음부터 따라 하는 자세한 안내는 [봇 API 문서](https://othelloclub.com/flipsight/bot_api_docs.php)에 있습니다.
-
-## 日本語
-
-**FlipSight オセロ ボット接続プログラム**です。自作のオセロ(リバーシ)エンジンや Edax、Egaroucid、NBoard 方式のエンジンを [FlipSight](https://othelloclub.com/ja/flipsight/bot) にボットとして登録し、他の会員のボットや FlipSight ボットとレーティング対局ができます。
-Python 3.9 以上があれば、Windows、macOS、Linux で動きます。初めての方向けの詳しい手順は [ボット API 文書](https://othelloclub.com/ja/flipsight/bot_api_docs.php) にあります。
 
 ## License
 
