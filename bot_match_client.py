@@ -7,6 +7,7 @@ Credentials stay in FS_BOT_TOKEN. Engine modes:
   --nboard CMD   a long-running engine that speaks the NBoard protocol (one engine per leg)
   --edax PATH    Edax 4.6 executable; NBoard setup and per-turn time allocation are automatic
   --egaroucid PATH  Egaroucid for Console 7.8.2; native setboard/settime/go commands
+                 --egaroucid-level N (1..60) plays a fixed level instead (no settime)
 The connector listens to the event stream (/flipsight_api/bot-stream) and reacts to opponent moves
 immediately; agent_poll stays as the safety net (every 10s while the stream is up, 1s/5s otherwise).
 """
@@ -425,8 +426,11 @@ class EdaxEngine(NBoardEngine):
 class EgaroucidEngine(NBoardEngine):
     """Native console protocol, one persistent process per leg; no GTP conversion."""
 
-    def __init__(self, command):
+    def __init__(self, command, level=0):
         super().__init__(command, 0)
+        # Level mode (1..60): the process was started with "-level N" and never receives
+        # settime, because one settime switches Egaroucid to time mode and ignores the level.
+        self.level = level
 
     def _start(self):
         self.process = start_process(self.command, engine_env())
@@ -463,7 +467,8 @@ class EgaroucidEngine(NBoardEngine):
                 if time.monotonic() >= deadline or cancel.is_set():
                     raise TimeoutError('search cancelled after initialization')
                 self._send('setboard %s %s' % (board, color))
-                self._send('settime %s %d' % (color, max(0, left_ms // 1000)))
+                if not self.level:
+                    self._send('settime %s %d' % (color, max(0, left_ms // 1000)))
                 self._send('go')
                 def accept(text):
                     if len(text) == 2 and text[0].lower() in 'abcdefgh' and text[1] in '12345678':
@@ -577,12 +582,13 @@ def main():
     engines.add_argument('--nboard', help='Local command of an engine that speaks the NBoard protocol (kept running)')
     engines.add_argument('--edax', metavar='PATH', help='Edax 4.6 executable; automatic NBoard setup and time allocation (standard 8x8 only)')
     engines.add_argument('--egaroucid', metavar='PATH', help='Egaroucid for Console 7.8.2 executable; native console with game time control (standard 8x8 only)')
+    parser.add_argument('--egaroucid-level', type=int, default=0, metavar='N', help='With --egaroucid: play Egaroucid level N (1..60) instead of game time control; 0 keeps time control. The per-turn cap still applies')
     parser.add_argument('--edax-eval', metavar='PATH', help='With --edax: eval.dat path; default is data/eval.dat beside the executable or its parent')
     # Since 2026-11-13 --engine always keeps one process per game. The old flag is accepted and ignored so existing commands keep working.
     parser.add_argument('--engine-persistent', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--nboard-depth', type=int, default=0, help='Send "set depth N" to the NBoard engine (0 = engine default)')
     parser.add_argument('--engine-name', help='Reported engine name, without commands or paths')
-    parser.add_argument('--engine-threads', type=int, metavar='N', help='Engine threads per game, shown on the bot record. With --edax/--egaroucid it is also passed to the engine (default 1)')
+    parser.add_argument('--engine-threads', type=int, metavar='N', help='Engine threads per game, shown on the bot record. With --edax/--egaroucid it is also passed to the engine (default 4 when the computer has more than 4 logical CPUs, otherwise 1)')
     parser.add_argument('--cpu-name', help='Optional reported CPU model')
     parser.add_argument('--max-think-seconds', type=float, default=10, help='Optional per-turn cap; default 10s, 0 uses the remaining game clock')
     parser.add_argument('--once-match', type=int, help='Only process this match; exit when finished, aborted, expired or rejected')
@@ -592,14 +598,19 @@ def main():
         parser.error('--edax-eval requires --edax')
     if args.nboard_depth and not (args.nboard or args.edax):
         parser.error('--nboard-depth requires --nboard or --edax')
+    if args.egaroucid_level and not args.egaroucid:
+        parser.error('--egaroucid-level requires --egaroucid')
+    if not 0 <= args.egaroucid_level <= 60:
+        parser.error('--egaroucid-level must be 0..60')
     for value in (args.engine_name, args.cpu_name):
         if value is not None and len(value) > 120:
             parser.error('reported names must be at most 120 characters')
     if args.engine_threads is not None and not 1 <= args.engine_threads <= 1024:
         parser.error('--engine-threads must be 1..1024')
     engine_name = args.engine_name or ('Edax' if args.edax else 'Egaroucid' if args.egaroucid else None)
-    # Threads per game: the connector sets them itself for Edax and Egaroucid; other engines report the value given here, if any.
-    threads = args.engine_threads or (1 if (args.edax or args.egaroucid) else None)
+    # Threads per game: the connector sets them itself for Edax and Egaroucid (default 4 when the computer has more
+    # than 4 logical CPUs, otherwise 1); other engines report the value given here, if any.
+    threads = args.engine_threads or ((4 if (os.cpu_count() or 1) > 4 else 1) if (args.edax or args.egaroucid) else None)
     environment = {'cpu': detect_cpu(args.cpu_name), 'engine': engine_name, 'os': platform.system()}
     if threads:
         environment['engine_threads'] = threads
@@ -614,6 +625,8 @@ def main():
             command = [executable, '-nboard', '-eval-file', evaluation, '-n-tasks', str(threads), '-ponder', 'off']
         elif args.egaroucid:
             command = [native_executable(args.egaroucid), '-quiet', '-noboard', '-thread', str(threads), '-hash', '20']
+            if args.egaroucid_level:
+                command += ['-level', str(args.egaroucid_level)]
         else:
             command = shlex.split(args.engine or args.nboard, posix=not WINDOWS)
     except ValueError as error:
@@ -679,7 +692,7 @@ def main():
         if args.engine_threads:
             request['engine_threads'] = args.engine_threads   # engines may size their search to this
         factory = (lambda: EdaxEngine(command, args.nboard_depth)) if args.edax else (
-            (lambda: EgaroucidEngine(command)) if args.egaroucid else (
+            (lambda: EgaroucidEngine(command, args.egaroucid_level)) if args.egaroucid else (
             (lambda: NBoardEngine(command, args.nboard_depth)) if args.nboard else (
             (lambda: PersistentJsonEngine(command)))))
         key = (request['match_id'], request['leg'], request.get('round_no'), request.get('room_created_at'))
