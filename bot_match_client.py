@@ -554,13 +554,17 @@ def thinking_budget(remaining_ms, max_think_seconds):
 
 
 def incoming_challenge(payload, my_id, selected=None):
-    """One paired match at a time; use the full poll even in single-match mode."""
+    """Pending pairs already reserve capacity; accept within the configured total load."""
+    bot = payload.get('bot') or {}
+    limit = bot.get('max_games', 2)
+    limit = max(1, min(8, limit if type(limit) is int else 2))
+    load = bot.get('games_now')
+    if type(load) is not int:
+        load = sum(m.get('status') in ('pending', 'running') for m in payload.get('matches', []))
+    if load > limit:
+        return None
     matches = [m for m in payload.get('matches', [])
                if int(m.get('id', 0)) > 0 and str(my_id) in (str(m.get('bot_a')), str(m.get('bot_b')))]
-    if any(m.get('status') == 'running' for m in matches):
-        return None
-    if any(m.get('status') == 'pending' and str(m.get('bot_a')) == str(my_id) for m in matches):
-        return None
     for match in matches:
         if (match.get('status') == 'pending' and str(match.get('bot_b')) == str(my_id)
                 and int(match['id']) > 0
