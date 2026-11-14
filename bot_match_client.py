@@ -564,6 +564,9 @@ def incoming_challenge(payload, my_id, selected=None):
     return None
 
 
+MAX_SEARCHES = 8   # the site's highest max_games
+
+
 def main():
     parser = argparse.ArgumentParser(description='FlipSight bot connector')
     parser.add_argument('--api', default='https://othelloclub.com/flipsight/bot_match_api.php')
@@ -647,14 +650,34 @@ def main():
         stream.start()
     engines_by_game = {}
     engine_lock = threading.Lock()
+    # Searches running at the same time follow "Max simultaneous games" in bot management (the bot's max_games),
+    # but at least 2 so both boards of a bot match can think together. Set threads x max games to fit your CPU.
+    searches = {'limit': 2, 'active': 0}
+    searches_changed = threading.Condition()
     def run_engine(request, deadline, cancel, queued_at):
-        # A third game may wait for the same two CPU workers. Charge that wait to
+        # A game over the limit waits for a free search. Charge that wait to
         # its actual clock, and keep persistent state separate for every room/leg.
+        with searches_changed:
+            while searches['active'] >= searches['limit']:
+                left = deadline - time.monotonic()
+                if cancel.is_set() or left <= 0:
+                    raise TimeoutError('queued search cancelled or expired')
+                searches_changed.wait(min(left, .2))
+            searches['active'] += 1
+        try:
+            return search(request, deadline, cancel, queued_at)
+        finally:
+            with searches_changed:
+                searches['active'] -= 1
+                searches_changed.notify_all()
+    def search(request, deadline, cancel, queued_at):
         elapsed = int((time.monotonic() - queued_at) * 1000)
         request = dict(request, remaining_ms=max(0, request['remaining_ms'] - elapsed),
                        budget_ms=max(0, int((deadline - time.monotonic()) * 1000)))
         if cancel.is_set() or request['budget_ms'] <= 0:
             raise TimeoutError('queued search cancelled or expired')
+        if args.engine_threads:
+            request['engine_threads'] = args.engine_threads   # engines may size their search to this
         factory = (lambda: EdaxEngine(command, args.nboard_depth)) if args.edax else (
             (lambda: EgaroucidEngine(command)) if args.egaroucid else (
             (lambda: NBoardEngine(command, args.nboard_depth)) if args.nboard else (
@@ -667,7 +690,7 @@ def main():
         return engine.move(request, deadline, cancel)
 
     jobs, submitted, failed = {}, set(), set()
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_SEARCHES)
     failures = 0
     once_human_seen = False
     limit = {'hit': False}
@@ -709,6 +732,12 @@ def main():
                         print('Selected match ended; connector stopped.', file=sys.stderr)
                         return 0
                 my_id = payload['bot']['id']
+                max_games = payload['bot'].get('max_games')
+                wanted = max(2, min(MAX_SEARCHES, max_games if type(max_games) is int else 2))
+                with searches_changed:
+                    if searches['limit'] != wanted:
+                        searches['limit'] = wanted
+                        searches_changed.notify_all()
                 turns = current_turns(payload, my_id)
                 for key, (future, cancel) in list(jobs.items()):
                     if key not in turns:

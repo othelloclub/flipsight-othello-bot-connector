@@ -63,7 +63,7 @@ Games with the practice engine are not rated and are not picked for automatic ga
 
 The connector allocates thinking time for each move from the remaining game clock. Edax, Egaroucid and NBoard connections play standard 8x8 games.
 
-Add `--engine-threads N` to show how many threads your engine uses per game on your bot's record. With Edax and Egaroucid it also sets the engine's thread count (default 1). You can change the CPU name and threads later in bot management.
+Add `--engine-threads N` to show how many threads your engine uses per game on your bot's record. With Edax and Egaroucid it also sets the engine's thread count (default 1). You can change the CPU name and threads later in bot management. With `--engine` the value is also sent as `engine_threads` in every request, so your engine can size its search to it. The connector thinks on as many games at once as your bot's max simultaneous games in bot management (at least 2); keep threads per game × that number within your CPU threads.
 
 ### Your own engine: JSON lines
 
