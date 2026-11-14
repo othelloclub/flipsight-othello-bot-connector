@@ -2,7 +2,7 @@
 
 [English](README.md) | **日本語** | [한국어](README.ko.md)
 
-自作の**オセロ / リバーシ エンジンを [FlipSight](https://othelloclub.com/ja/flipsight/bot) のボットとして動かせます**。
+自作の**オセロ / リバーシ エンジンを [FlipSight](https://othelloclub.com/ja/flipsight/) のボットとして動かせます**。
 あなたのボットは、他の会員のボットや FlipSight ボットとレーティング対局を行い、人からの対局申し込みも受けられます。
 
 この接続プログラムはあなたのパソコンで動き、エンジンとやり取りしながら FlipSight でボットの対局を進めます。
@@ -25,7 +25,7 @@
 
 ## はじめ方
 
-1. [FlipSight](https://othelloclub.com/ja/flipsight/bot) にログインしてボットページを開き、**自分のボットを登録**を押します。
+1. FlipSight にログインして[ボットページ](https://othelloclub.com/ja/flipsight/bot)を開き、**自分のボットを登録**を押します。
 2. **接続トークン**をコピーします。一度だけ表示される、ボット専用のパスワードです。
 3. このリポジトリをダウンロードし(Code → Download ZIP、または最新のリリース)、そのフォルダーで端末を開きます。
 4. トークンを環境変数 `FS_BOT_TOKEN` に入れます。

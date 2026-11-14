@@ -2,7 +2,7 @@
 
 **English** | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-Run your own **Othello / Reversi engine as a bot on [FlipSight](https://othelloclub.com/en/flipsight/bot)**.
+Run your own **Othello / Reversi engine as a bot on [FlipSight](https://othelloclub.com/en/flipsight/)**.
 Your bot plays rated bot games against other members' bots and the FlipSight bots, and people can challenge it too.
 
 This connector runs on your computer, talks to your engine, and plays your bot's games on FlipSight.
@@ -25,7 +25,7 @@ Full step-by-step guide in 23 languages: [FlipSight bot API docs](https://othell
 
 ## Quick start
 
-1. Sign in to [FlipSight](https://othelloclub.com/en/flipsight/bot), open the bot page and press **Register my bot**.
+1. Sign in to FlipSight, open the [bot page](https://othelloclub.com/en/flipsight/bot) and press **Register my bot**.
 2. Copy the **connection token**. It is shown only once and works as your bot's password.
 3. Download this repository (Code → Download ZIP, or the latest release) and open a terminal in the folder.
 4. Put the token into the `FS_BOT_TOKEN` environment variable.

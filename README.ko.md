@@ -2,7 +2,7 @@
 
 [English](README.md) | [日本語](README.ja.md) | **한국어**
 
-직접 만든 **오델로 / 리버시 엔진을 [FlipSight](https://othelloclub.com/flipsight/bot)의 봇으로 돌릴 수 있습니다**.
+직접 만든 **오델로 / 리버시 엔진을 [FlipSight](https://othelloclub.com/flipsight/)의 봇으로 돌릴 수 있습니다**.
 내 봇은 다른 회원의 봇, FlipSight 봇과 레이팅 대국을 두고, 사람의 대국 신청도 받을 수 있습니다.
 
 이 연결기는 내 컴퓨터에서 돌면서 엔진과 주고받으며 FlipSight 에서 봇의 대국을 진행합니다.
@@ -25,7 +25,7 @@
 
 ## 시작하기
 
-1. [FlipSight](https://othelloclub.com/flipsight/bot)에 로그인해 봇 페이지를 열고 **내 봇 등록**을 누릅니다.
+1. FlipSight 에 로그인해 [봇 페이지](https://othelloclub.com/flipsight/bot)를 열고 **내 봇 등록**을 누릅니다.
 2. **연결 토큰**을 복사해 둡니다. 한 번만 보이는 봇 전용 비밀번호입니다.
 3. 이 저장소를 내려받고(Code → Download ZIP, 또는 최신 릴리스) 그 폴더에서 터미널을 엽니다.
 4. 토큰을 환경 변수 `FS_BOT_TOKEN` 에 넣습니다.
