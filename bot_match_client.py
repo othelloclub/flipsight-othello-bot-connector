@@ -579,7 +579,7 @@ def main():
     parser.add_argument('--engine-persistent', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--nboard-depth', type=int, default=0, help='Send "set depth N" to the NBoard engine (0 = engine default)')
     parser.add_argument('--engine-name', help='Reported engine name, without commands or paths')
-    parser.add_argument('--engine-threads', dest='_legacy_engine_threads', help=argparse.SUPPRESS)  # Accepted and ignored for older launch commands.
+    parser.add_argument('--engine-threads', type=int, metavar='N', help='Engine threads per game, shown on the bot record. With --edax/--egaroucid it is also passed to the engine (default 1)')
     parser.add_argument('--cpu-name', help='Optional reported CPU model')
     parser.add_argument('--max-think-seconds', type=float, default=10, help='Optional per-turn cap; default 10s, 0 uses the remaining game clock')
     parser.add_argument('--once-match', type=int, help='Only process this match; exit when finished, aborted, expired or rejected')
@@ -592,8 +592,14 @@ def main():
     for value in (args.engine_name, args.cpu_name):
         if value is not None and len(value) > 120:
             parser.error('reported names must be at most 120 characters')
+    if args.engine_threads is not None and not 1 <= args.engine_threads <= 1024:
+        parser.error('--engine-threads must be 1..1024')
     engine_name = args.engine_name or ('Edax' if args.edax else 'Egaroucid' if args.egaroucid else None)
+    # Threads per game: the connector sets them itself for Edax and Egaroucid; other engines report the value given here, if any.
+    threads = args.engine_threads or (1 if (args.edax or args.egaroucid) else None)
     environment = {'cpu': detect_cpu(args.cpu_name), 'engine': engine_name, 'os': platform.system()}
+    if threads:
+        environment['engine_threads'] = threads
     try:
         if args.edax:
             executable = native_executable(args.edax)
@@ -602,9 +608,9 @@ def main():
             evaluation = next((os.path.abspath(os.path.expanduser(p)) for p in candidates if os.path.isfile(os.path.expanduser(p))), None)
             if not evaluation:
                 raise ValueError('Edax eval.dat not found; specify --edax-eval PATH')
-            command = [executable, '-nboard', '-eval-file', evaluation, '-n-tasks', '1', '-ponder', 'off']
+            command = [executable, '-nboard', '-eval-file', evaluation, '-n-tasks', str(threads), '-ponder', 'off']
         elif args.egaroucid:
-            command = [native_executable(args.egaroucid), '-quiet', '-noboard', '-thread', '1', '-hash', '20']
+            command = [native_executable(args.egaroucid), '-quiet', '-noboard', '-thread', str(threads), '-hash', '20']
         else:
             command = shlex.split(args.engine or args.nboard, posix=not WINDOWS)
     except ValueError as error:
