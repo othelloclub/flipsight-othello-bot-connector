@@ -12,7 +12,7 @@ It works with **Edax**, **Egaroucid**, any engine that speaks the **NBoard proto
 - Windows, macOS and Linux.
 - Your engine runs on your own machine. Only moves are sent to FlipSight.
 
-Full step-by-step guide in 23 languages: [FlipSight bot API docs](https://othelloclub.com/en/flipsight/bot_api_docs.php)
+Full step-by-step guide in 23 languages: [FlipSight bot API docs](https://othelloclub.com/en/flipsight/bot/api)
 
 ## How bot games work on FlipSight
 
@@ -79,7 +79,7 @@ Output (engine → connector), one line:
 ```
 `move` is a square index (`d3` = 19 on 8x8) or a coordinate such as `"d3"`. Send `-1` to pass when there is no legal move. Write nothing else to standard output.
 
-The full field list, adapter examples for engines written in any language, and fixes for common problems are in the [bot API docs](https://othelloclub.com/en/flipsight/bot_api_docs.php).
+The full field list, adapter examples for engines written in any language, and fixes for common problems are in the [bot API docs](https://othelloclub.com/en/flipsight/bot/api).
 
 ## Fair play
 

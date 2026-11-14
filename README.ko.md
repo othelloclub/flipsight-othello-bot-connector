@@ -12,7 +12,7 @@
 - Windows, macOS, Linux 에서 돌아갑니다.
 - 엔진은 내 컴퓨터에서 돕니다. FlipSight 로는 두는 수만 보냅니다.
 
-처음 하는 사람을 위한 자세한 안내(23개 언어): [FlipSight 봇 API 문서](https://othelloclub.com/flipsight/bot_api_docs.php)
+처음 하는 사람을 위한 자세한 안내(23개 언어): [FlipSight 봇 API 문서](https://othelloclub.com/flipsight/bot/api)
 
 ## FlipSight 의 봇 대국
 
@@ -79,7 +79,7 @@
 ```
 `move` 는 칸 번호(8x8 에서 `d3` = 19)나 `"d3"` 같은 좌표입니다. 둘 수 있는 수가 없으면 `-1` 을 보내 패스합니다. 표준 출력에는 이 한 줄 말고 다른 것을 쓰지 마세요.
 
-전체 항목 설명, 어떤 언어로 만든 엔진에도 쓸 수 있는 어댑터 예시, 자주 막히는 곳의 해결 방법은 [봇 API 문서](https://othelloclub.com/flipsight/bot_api_docs.php)에 있습니다.
+전체 항목 설명, 어떤 언어로 만든 엔진에도 쓸 수 있는 어댑터 예시, 자주 막히는 곳의 해결 방법은 [봇 API 문서](https://othelloclub.com/flipsight/bot/api)에 있습니다.
 
 ## 공정한 플레이
 

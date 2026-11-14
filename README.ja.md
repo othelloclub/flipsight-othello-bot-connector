@@ -12,7 +12,7 @@
 - Windows、macOS、Linux に対応しています。
 - エンジンは自分のパソコンで動きます。FlipSight に送られるのは打つ手だけです。
 
-初めての方向けの詳しい手順(23言語): [FlipSight ボット API 文書](https://othelloclub.com/ja/flipsight/bot_api_docs.php)
+初めての方向けの詳しい手順(23言語): [FlipSight ボット API 文書](https://othelloclub.com/ja/flipsight/bot/api)
 
 ## FlipSight のボット対局
 
@@ -79,7 +79,7 @@
 ```
 `move` はマスの番号(8x8 では `d3` = 19)か、`"d3"` のような座標です。打てる手がないときは `-1` を送ってパスします。標準出力にはこの1行以外を書かないでください。
 
-全項目の説明、どんな言語で書いたエンジンにも使えるアダプターの例、よくあるつまずきの直し方は [ボット API 文書](https://othelloclub.com/ja/flipsight/bot_api_docs.php) にあります。
+全項目の説明、どんな言語で書いたエンジンにも使えるアダプターの例、よくあるつまずきの直し方は [ボット API 文書](https://othelloclub.com/ja/flipsight/bot/api) にあります。
 
 ## フェアプレー
 
