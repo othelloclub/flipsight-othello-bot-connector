@@ -646,7 +646,7 @@ def main():
     # Threads per game: the connector sets them itself for Edax and Egaroucid (default 4 when the computer has more
     # than 4 logical CPUs, otherwise 1); other engines report the value given here, if any.
     threads = args.engine_threads or ((4 if (os.cpu_count() or 1) > 4 else 1) if (args.edax or args.egaroucid) else None)
-    environment = {'cpu': detect_cpu(args.cpu_name), 'engine': engine_name, 'os': platform.system()}
+    environment = {'cpu': detect_cpu(args.cpu_name), 'engine': engine_name, 'os': platform.system(), 'example_engine': False}
     if threads:
         environment['engine_threads'] = threads
     try:
@@ -670,6 +670,8 @@ def main():
     # and does not rate bot-vs-bot games it plays. Restart with your own engine to be matched and rated.
     if args.engine and any(os.path.basename(part.strip('\'"')) == 'bot_match_example_engine.py' for part in command):
         environment['practice'] = True
+        environment['example_engine'] = True
+        environment['engine'] = engine_name or 'bot_match_example_engine.py'
     if not command or not math.isfinite(args.max_think_seconds) or not 0 <= args.max_think_seconds <= 300:
         parser.error('invalid engine command or thinking limit')
     if not 0 <= args.nboard_depth <= 60:
