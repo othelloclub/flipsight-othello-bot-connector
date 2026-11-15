@@ -495,13 +495,44 @@ class EgaroucidEngine(NBoardEngine):
 
 
 def detect_cpu(cpu_name):
-    cpu = cpu_name or platform.processor() or platform.machine()
-    if not cpu_name and platform.system() == 'Darwin':
+    if cpu_name:
+        return cpu_name[:120]
+    cpu = platform.processor() or platform.machine()
+    system = platform.system()
+    if system == 'Windows':
+        # platform.processor() is commonly a Family/Model/Stepping identifier.
+        # Read the product name once at startup, without an extra package/process.
         try:
-            cpu = subprocess.check_output(['sysctl', '-n', 'machdep.cpu.brand_string'], text=True, timeout=1).strip()
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                r'HARDWARE\DESCRIPTION\System\CentralProcessor\0') as key:
+                value, _ = winreg.QueryValueEx(key, 'ProcessorNameString')
+            if isinstance(value, str) and value.strip():
+                return ' '.join(value.split())[:120]
+        except (ImportError, OSError):
+            pass
+        # Some Windows environments restrict registry access. Keep a bounded,
+        # noninteractive fallback; failure must never stop the bot connector.
+        try:
+            value = subprocess.check_output([
+                'powershell.exe', '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+                "$ErrorActionPreference='Stop'; "
+                "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+                "Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name"
+            ], encoding='utf-8', errors='replace', timeout=2, stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)).strip()
+            if value:
+                cpu = value
         except (OSError, subprocess.SubprocessError):
             pass
-    return cpu[:120]
+    elif system == 'Darwin':
+        try:
+            value = subprocess.check_output(['sysctl', '-n', 'machdep.cpu.brand_string'], text=True, timeout=1).strip()
+            if value:
+                cpu = value
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return ' '.join(cpu.split())[:120]
 
 
 def current_turns(payload, my_id):
