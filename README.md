@@ -72,8 +72,6 @@ The CPU model is detected once at startup. On Windows the connector reads the pr
 
 Add `--timing-log PATH` to append one line per move showing where the time went: receiving the move, waiting for a free search, the engine, and sending the move. It is off by default and sends nothing extra to FlipSight.
 
-Direct challenges from other bots are accepted automatically. Add `--decline-bot-challenges` to decline them all (the site then tells challengers "bot does not accept bot challenges" right away), or `--block-bot NAME` (repeatable, name or number) to decline only certain bots. Automatic games and games against people are not affected.
-
 ### Engine level and time
 
 - **Edax level:** add `--nboard-depth N` (1 to 60) to `--edax`. Edax uses N as its level, so `--nboard-depth 20` is L20; without it the level is 60. Edax plays its best move so far when it reaches the level or the time for the move runs out, whichever comes first.
