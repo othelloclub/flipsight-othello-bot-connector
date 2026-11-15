@@ -797,9 +797,10 @@ def main():
         stream.start()
     engines_by_game = {}
     engine_lock = threading.Lock()
-    # Searches running at the same time follow "Max simultaneous games" in bot management (the bot's max_games),
-    # but at least 2 so both boards of a bot match can think together. Set threads x max games to fit your CPU.
-    searches = {'limit': 2, 'active': 0}
+    # Games thinking at the same time follow "Max simultaneous games" in bot management (the bot's max_games),
+    # counted like the site: both boards of a bot match are one game and think together in one slot. So with
+    # max games 2 a bot match plus a human game run 3 engines. Set threads x (max games + 1) to fit your CPU.
+    searches = {'limit': 2, 'games': {}}   # game (match id) -> searches running
     searches_changed = threading.Condition()
     timings = {}   # --timing-log: turn key -> local monotonic stamps
     def stamp(tkey, name):
@@ -807,15 +808,18 @@ def main():
         if entry is not None:
             entry[name] = time.monotonic()
     def run_engine(request, deadline, cancel, queued_at, tkey=None):
-        # A game over the limit waits for a free search. Charge that wait to
-        # its actual clock, and keep persistent state separate for every room/leg.
+        # A game over the limit waits for a free slot (the other board of a bot match already
+        # holds its game's slot). Charge that wait to its actual clock, and keep persistent
+        # state separate for every room/leg.
+        game = request['match_id']
+        games = searches['games']
         with searches_changed:
-            while searches['active'] >= searches['limit']:
+            while game not in games and len(games) >= searches['limit']:
                 left = deadline - time.monotonic()
                 if cancel.is_set() or left <= 0:
                     raise TimeoutError('queued search cancelled or expired')
                 searches_changed.wait(min(left, .2))
-            searches['active'] += 1
+            games[game] = games.get(game, 0) + 1
         try:
             stamp(tkey, 'start')
             move = search(request, deadline, cancel, queued_at)
@@ -823,7 +827,10 @@ def main():
             return move
         finally:
             with searches_changed:
-                searches['active'] -= 1
+                if games[game] > 1:
+                    games[game] -= 1
+                else:
+                    del games[game]
                 searches_changed.notify_all()
     def search(request, deadline, cancel, queued_at):
         elapsed = int((time.monotonic() - queued_at) * 1000)
@@ -845,7 +852,7 @@ def main():
         return engine.move(request, deadline, cancel)
 
     jobs, submitted, failed = {}, set(), set()
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_SEARCHES)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_SEARCHES + 1)   # + the second board of a bot match
     failures = 0
     # The last agent_poll result, kept current with view "agent" stream events, and the server clock behind it
     # (server_now_ms and the local time it was taken) so remaining clocks are computed for "now".
@@ -922,7 +929,7 @@ def main():
                         return 0
                 my_id = payload['bot']['id']
                 max_games = payload['bot'].get('max_games')
-                wanted = max(2, min(MAX_SEARCHES, max_games if type(max_games) is int else 2))
+                wanted = max(1, min(MAX_SEARCHES, max_games if type(max_games) is int else 2))
                 with searches_changed:
                     if searches['limit'] != wanted:
                         searches['limit'] = wanted
