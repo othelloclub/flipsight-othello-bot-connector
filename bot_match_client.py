@@ -722,6 +722,10 @@ def main():
     parser.add_argument('--max-think-seconds', type=float, default=10, help='Optional per-turn cap; default 10s, 0 uses the remaining game clock')
     parser.add_argument('--once-match', type=int, help='Only process this match; exit when finished, aborted, expired or rejected')
     parser.add_argument('--max-runtime', type=float, help='Stop after this many seconds (engine cleanup follows)')
+    parser.add_argument('--block-bot', action='append', default=[], metavar='NAME_OR_ID',
+                        help='Decline direct challenges from this bot (name or number); repeat for more bots')
+    parser.add_argument('--decline-bot-challenges', action='store_true',
+                        help='Decline every direct challenge from another bot. Automatic games and games against people are not affected')
     parser.add_argument('--timing-log', metavar='PATH', help='Append one line per submitted move with where the time went '
                         '(update seen, waiting for a search slot, engine, submitting); off by default')
     args = parser.parse_args()
@@ -745,6 +749,9 @@ def main():
     environment = {'cpu': detect_cpu(args.cpu_name), 'engine': engine_name, 'os': platform.system(), 'example_engine': False}
     if threads:
         environment['engine_threads'] = threads
+    if args.decline_bot_challenges:
+        # The site then refuses other bots' challenges before creating them ("bot does not accept bot challenges").
+        environment['accept_bot_challenges'] = False
     try:
         if args.edax:
             executable = native_executable(args.edax)
@@ -852,6 +859,8 @@ def main():
         return engine.move(request, deadline, cancel)
 
     jobs, submitted, failed = {}, set(), set()
+    blocked = {str(b).strip().lower() for b in args.block_bot if str(b).strip()}
+    declined = set()   # challenge ids already declined, so each is answered once
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_SEARCHES + 1)   # + the second board of a bot match
     failures = 0
     # The last agent_poll result, kept current with view "agent" stream events, and the server clock behind it
@@ -917,6 +926,28 @@ def main():
                 payload = base
                 if server_clock is not None:
                     payload['server_now_ms'] = server_clock[0] + int((time.monotonic() - server_clock[1]) * 1000)
+                if blocked or args.decline_bot_challenges:
+                    # Decline direct challenges by rule (like lichess-bot block_list). Automatic games
+                    # (auto) are made by the server and are never declined here.
+                    names = {str(b.get('id')): str(b.get('name') or '').strip().lower()
+                             for b in (payload.get('bots') or []) + (payload.get('record_bots') or []) if isinstance(b, dict)}
+                    for m in payload.get('matches', []):
+                        if (not isinstance(m, dict) or m.get('status') != 'pending' or m.get('auto')
+                                or str(m.get('bot_b')) != str(payload['bot']['id']) or type(m.get('id')) is not int
+                                or m['id'] <= 0 or m['id'] in declined):
+                            continue
+                        challenger = str(m.get('bot_a'))
+                        if args.decline_bot_challenges or challenger in blocked or names.get(challenger, '') in blocked:
+                            declined.add(m['id'])
+                            try:
+                                api.call('agent_reject', match_id=m['id'])
+                                print('Declined challenge %d from bot %s.' % (m['id'], challenger), file=sys.stderr)
+                            except RuntimeError:
+                                pass   # already answered or expired
+                    if declined:
+                        payload['matches'] = [m for m in payload.get('matches', []) if not (isinstance(m, dict) and m.get('id') in declined)]
+                    if len(declined) > 2000:
+                        declined.clear()
                 challenge = incoming_challenge(payload, payload['bot']['id'], args.once_match)
                 if args.once_match is not None:
                     payload['matches'] = [m for m in payload.get('matches', []) if str(m.get('id')) == str(args.once_match)]
