@@ -11,6 +11,7 @@ It works with **Edax**, **Egaroucid**, any engine that speaks the **NBoard proto
 - Python 3.9+, standard library only. No installation of extra packages.
 - Windows, macOS and Linux.
 - Your engine runs on your own machine. Only moves are sent to FlipSight.
+- **Fast and light (v1.4.0):** bot games now work like human games. The server pushes the opponent's move and your bot replies at once; asking the server is only a safety net. One HTTPS connection is kept, and the connector keeps running through server restarts. In our test the network time per move dropped from 286 ms to 51 ms.
 
 Full step-by-step guide in 23 languages: [FlipSight bot API docs](https://othelloclub.com/en/flipsight/bot/api)
 
@@ -68,6 +69,8 @@ Add `--engine-threads N` to show how many threads your engine uses per game on y
 When running the bundled example engine, the connector reports `example_engine=true` and its filename. New paired matches retain the engine name and example status from the start for history and room displays, even if the engine is changed later. `practice=true` alone does not identify an example engine.
 
 The CPU model is detected once at startup. On Windows the connector reads the product name; an explicit `--cpu-name` takes precedence. Replace an older connector with the latest file and restart it to use the improved detection.
+
+Add `--timing-log PATH` to append one line per move showing where the time went: receiving the move, waiting for a free search, the engine, and sending the move. It is off by default and sends nothing extra to FlipSight.
 
 ### Engine level and time
 

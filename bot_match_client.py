@@ -9,10 +9,13 @@ Credentials stay in FS_BOT_TOKEN. Engine modes:
   --egaroucid PATH  Egaroucid for Console 7.8.2; native setboard/settime/go commands
                  --egaroucid-level N (1..60) plays a fixed level instead (no settime)
 The connector listens to the event stream (/flipsight_api/bot-stream) and reacts to opponent moves
-immediately; agent_poll stays as the safety net (every 10s while the stream is up, 1s/5s otherwise).
+immediately. Events that carry this bot's own view (view "agent") update the last poll result in place, so the
+engine starts and its move is sent without another poll. agent_poll stays as the safety net: while the stream is up
+every 10s during a game and every 60s when idle, 1s/5s while the stream is down.
 """
 import argparse
 import concurrent.futures
+import http.client
 import json
 import math
 import os
@@ -22,6 +25,7 @@ import random
 import shlex
 import shutil
 import signal
+import ssl
 import subprocess
 import sys
 import threading
@@ -51,24 +55,81 @@ def check_https(url, what):
 
 
 class API:
+    """POSTs to the bot API. Keeps one HTTPS connection open (keep-alive) so a move does not pay a new TCP and TLS
+    handshake every time (measured about 20-34 ms per request from a home PC). Behind an HTTPS proxy it uses urllib,
+    which reads the proxy settings, and opens a connection per request as before."""
+
     def __init__(self, url, token):
-        check_https(url, 'API')
+        parts = check_https(url, 'API')
         if not token or '\r' in token or '\n' in token:
             raise ValueError('FS_BOT_TOKEN is missing or invalid')
         self.url, self.token = url, token
         self.opener = urllib.request.build_opener(NoRedirect())
+        self.host, self.port, self.path = parts.hostname, parts.port or 443, parts.path or '/'
+        self.keep_alive = not urllib.request.getproxies().get('https')
+        self.context = ssl.create_default_context()
+        self.connection = None
+        self.last_reused = False
+        self.lock = threading.Lock()
+
+    def close(self):
+        if self.connection is not None:
+            try:
+                self.connection.close()
+            except OSError:
+                pass
+            self.connection = None
+
+    def post(self, body, headers):
+        """One POST on the kept connection. Returns (status, body)."""
+        for attempt in (0, 1):
+            reused = self.connection is not None
+            if not reused:
+                self.connection = http.client.HTTPSConnection(self.host, self.port, timeout=8, context=self.context)
+            try:
+                self.connection.request('POST', self.path, body=body, headers=headers)
+                response = self.connection.getresponse()
+                data = response.read(1024 * 1024 + 1)
+                if not response.isclosed() or response.will_close:
+                    self.close()   # unread rest or server closes: start fresh next time
+                self.last_reused = reused
+                return response.status, data
+            except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                self.close()
+                # The server closed an idle kept connection: send once more on a new one. A move cannot apply
+                # twice (the server checks the expected revision); other errors and timeouts are not retried.
+                if not reused or attempt:
+                    raise
+            except Exception:
+                self.close()
+                raise
+        raise RuntimeError('unreachable')
 
     def call(self, action, **fields):
-        request = urllib.request.Request(self.url, data=json.dumps(dict(action=action, **fields)).encode(),
-            headers={'Authorization': 'Bearer ' + self.token, 'Content-Type': 'application/json', 'Accept': 'application/json'}, method='POST')
-        try:
-            with self.opener.open(request, timeout=8) as response:
-                body = response.read(1024 * 1024 + 1)
-        except urllib.error.HTTPError as error:
+        body = json.dumps(dict(action=action, **fields)).encode()
+        headers = {'Authorization': 'Bearer ' + self.token, 'Content-Type': 'application/json', 'Accept': 'application/json',
+                   'User-Agent': 'Python-urllib/%d.%d' % sys.version_info[:2]}
+        if self.keep_alive:
+            with self.lock:
+                status, body = self.post(body, headers)
             # Never log response bodies: a proxy could echo the authorization header.
-            if error.code in (401, 403):
-                raise PermissionError('authentication denied') from None
-            raise RuntimeError('HTTP ' + str(error.code)) from None
+            if status in (401, 403):
+                raise PermissionError('authentication denied')
+            if 300 <= status < 400:
+                raise RuntimeError('redirect refused')
+            if status >= 400:
+                raise RuntimeError('HTTP ' + str(status))
+        else:
+            request = urllib.request.Request(self.url, data=body, headers=headers, method='POST')
+            try:
+                with self.opener.open(request, timeout=8) as response:
+                    body = response.read(1024 * 1024 + 1)
+            except urllib.error.HTTPError as error:
+                # Never log response bodies: a proxy could echo the authorization header.
+                if error.code in (401, 403):
+                    raise PermissionError('authentication denied') from None
+                raise RuntimeError('HTTP ' + str(error.code)) from None
+            self.last_reused = False
         if len(body) > 1024 * 1024:
             raise RuntimeError('response too large')
         data = json.loads(body)
@@ -78,11 +139,11 @@ class API:
 
 
 class EventStream(threading.Thread):
-    """Reads NDJSON events. Any 'match' event wakes the main loop, which then polls once."""
+    """Reads NDJSON events, hands hello and match events to the main loop (events queue) and wakes it."""
 
-    def __init__(self, url, token, wake):
+    def __init__(self, url, token, wake, events=None):
         super().__init__(daemon=True)
-        self.url, self.token, self.wake = url, token, wake
+        self.url, self.token, self.wake, self.events = url, token, wake, events
         self.opener = urllib.request.build_opener(NoRedirect())
         self.healthy = False
         self.denied = False
@@ -106,8 +167,13 @@ class EventStream(threading.Thread):
                             continue
                         if event.get('type') == 'hello':
                             self.healthy, backoff = True, 1.0
+                            if self.events is not None:
+                                self.events.put(event)   # a new connection may have missed events: poll once
                             self.wake.set()
                         elif event.get('type') == 'match':
+                            if self.events is not None:
+                                event['_received'] = time.monotonic()   # for --timing-log
+                                self.events.put(event)
                             self.wake.set()
             except urllib.error.HTTPError as error:
                 if error.code in (401, 403):
@@ -121,6 +187,34 @@ class EventStream(threading.Thread):
                 self.wake.set()   # fall back to fast polling right away
             self.stopping.wait(backoff + random.random())
             backoff = min(30.0, backoff * 2)
+
+
+def match_revision(match):
+    state = match.get('state') if isinstance(match, dict) else None
+    revision = state.get('revision') if isinstance(state, dict) else None
+    return revision if type(revision) is int else -1
+
+
+def apply_stream_event(base, event):
+    """Fold a stream event into the last agent_poll result. Returns False when a poll is needed instead.
+
+    Only events with this bot's own view (view "agent", the same value agent_poll returns) are used, and only for a
+    match the last poll already listed that is not waiting for acceptance. New pairings, invitations, human games,
+    hello and events from an older server poll as before."""
+    if base is None or event.get('type') != 'match' or event.get('view') != 'agent':
+        return False
+    match = event.get('match')
+    if not isinstance(match, dict) or type(match.get('id')) is not int or match['id'] <= 0 or match.get('status') == 'pending':
+        return False
+    matches = base.get('matches')
+    if not isinstance(matches, list):
+        return False
+    for index, old in enumerate(matches):
+        if isinstance(old, dict) and old.get('id') == match['id']:
+            if match_revision(match) >= match_revision(old):   # a late, older snapshot never replaces a newer one
+                matches[index] = match
+            return True
+    return False
 
 
 def legal_moves(board, color):
@@ -628,6 +722,8 @@ def main():
     parser.add_argument('--max-think-seconds', type=float, default=10, help='Optional per-turn cap; default 10s, 0 uses the remaining game clock')
     parser.add_argument('--once-match', type=int, help='Only process this match; exit when finished, aborted, expired or rejected')
     parser.add_argument('--max-runtime', type=float, help='Stop after this many seconds (engine cleanup follows)')
+    parser.add_argument('--timing-log', metavar='PATH', help='Append one line per submitted move with where the time went '
+                        '(update seen, waiting for a search slot, engine, submitting); off by default')
     args = parser.parse_args()
     if args.edax_eval and not args.edax:
         parser.error('--edax-eval requires --edax')
@@ -694,9 +790,10 @@ def main():
         parser.error(str(error))
 
     wake = threading.Event()
+    events = queue.SimpleQueue()
     stream = None
     if stream_url:
-        stream = EventStream(stream_url, token, wake)
+        stream = EventStream(stream_url, token, wake, events)
         stream.start()
     engines_by_game = {}
     engine_lock = threading.Lock()
@@ -704,7 +801,12 @@ def main():
     # but at least 2 so both boards of a bot match can think together. Set threads x max games to fit your CPU.
     searches = {'limit': 2, 'active': 0}
     searches_changed = threading.Condition()
-    def run_engine(request, deadline, cancel, queued_at):
+    timings = {}   # --timing-log: turn key -> local monotonic stamps
+    def stamp(tkey, name):
+        entry = timings.get(tkey)
+        if entry is not None:
+            entry[name] = time.monotonic()
+    def run_engine(request, deadline, cancel, queued_at, tkey=None):
         # A game over the limit waits for a free search. Charge that wait to
         # its actual clock, and keep persistent state separate for every room/leg.
         with searches_changed:
@@ -715,7 +817,10 @@ def main():
                 searches_changed.wait(min(left, .2))
             searches['active'] += 1
         try:
-            return search(request, deadline, cancel, queued_at)
+            stamp(tkey, 'start')
+            move = search(request, deadline, cancel, queued_at)
+            stamp(tkey, 'end')
+            return move
         finally:
             with searches_changed:
                 searches['active'] -= 1
@@ -742,6 +847,17 @@ def main():
     jobs, submitted, failed = {}, set(), set()
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_SEARCHES)
     failures = 0
+    # The last agent_poll result, kept current with view "agent" stream events, and the server clock behind it
+    # (server_now_ms and the local time it was taken) so remaining clocks are computed for "now".
+    base, server_clock = None, None
+    last_poll, poll_every, poll_now = None, 0.0, True
+    seen = {}   # --timing-log: match id -> (how the latest state arrived: event or poll, local time)
+    timing_file = None
+    if args.timing_log:
+        try:
+            timing_file = open(args.timing_log, 'a', encoding='ascii', buffering=1)
+        except OSError as error:
+            parser.error('cannot open --timing-log: %s' % error)
     once_human_seen = False
     limit = {'hit': False}
     timer = None
@@ -770,7 +886,30 @@ def main():
                 print('Bot credential rejected by the event stream. Stopping.', file=sys.stderr)
                 return 2
             try:
-                payload = api.call('agent_poll', environment=environment)
+                while True:
+                    try:
+                        event = events.get_nowait()
+                    except queue.Empty:
+                        break
+                    if apply_stream_event(base, event):
+                        seen[event['match']['id']] = ('event', event.get('_received', time.monotonic()))
+                        now_ms = event.get('server_now_ms')
+                        if type(now_ms) in (int, float) and server_clock is not None and now_ms >= server_clock[0]:
+                            server_clock = (now_ms, time.monotonic())
+                    else:
+                        poll_now = True
+                if poll_now or base is None or last_poll is None or time.monotonic() - last_poll >= poll_every:
+                    poll_now = True   # stays set if the poll fails, so the next round polls again
+                    base = api.call('agent_poll', environment=environment, history='brief')
+                    last_poll, poll_now = time.monotonic(), False
+                    for polled in base.get('matches', []):
+                        if isinstance(polled, dict) and polled.get('status') == 'running':
+                            seen[polled.get('id')] = ('poll', last_poll)
+                    now_ms = base.get('server_now_ms')
+                    server_clock = (now_ms, last_poll) if type(now_ms) in (int, float) else None
+                payload = base
+                if server_clock is not None:
+                    payload['server_now_ms'] = server_clock[0] + int((time.monotonic() - server_clock[1]) * 1000)
                 challenge = incoming_challenge(payload, payload['bot']['id'], args.once_match)
                 if args.once_match is not None:
                     payload['matches'] = [m for m in payload.get('matches', []) if str(m.get('id')) == str(args.once_match)]
@@ -794,6 +933,7 @@ def main():
                         cancel.set()
                         future.cancel()
                         del jobs[key]
+                        timings.pop(key, None)
                 active_games = {(int(m['id']), i, m.get('round_no'), m.get('room_created_at'))
                                 for m in payload.get('matches', []) if m.get('status') == 'running'
                                 for i, _ in enumerate((m.get('state') or {}).get('legs', [])[:2])}
@@ -805,6 +945,7 @@ def main():
                 failed.intersection_update(turns)
                 if challenge is not None:
                     api.call('agent_accept', match_id=challenge)
+                    poll_now = True
                     wake.set()  # Fetch the newly started boards without waiting for a stream event.
                 busy = False
                 for key, request in turns.items():
@@ -818,7 +959,10 @@ def main():
                             continue
                         request['budget_ms'] = int(budget * 1000)
                         queued_at = time.monotonic()
-                        future = executor.submit(run_engine, request, queued_at + budget, cancel, queued_at)
+                        if timing_file is not None:
+                            how, at = seen.get(key[0], ('unknown', queued_at))
+                            timings[key] = {'src': how, 'seen': at, 'queued': queued_at}
+                        future = executor.submit(run_engine, request, queued_at + budget, cancel, queued_at, key)
                         future.add_done_callback(lambda _f: wake.set())   # submit as soon as the engine answers
                         jobs[key] = (future, cancel)
                     future, _ = jobs[key]
@@ -831,26 +975,54 @@ def main():
                         print('Engine failed for match %s leg %s; awaiting timeout or manual recovery.' % key[:2], file=sys.stderr)
                         failed.add(key)
                         del jobs[key]
+                        timings.pop(key, None)
                         continue
                     # If the response is lost, the next poll observes the revision. Otherwise retry
                     # the exact move with the same expected revision; never compute twice.
                     # Human matches (negative id) also need the room's round and creation time.
                     extra = {'round_no': key[3], 'room_created_at': key[4]} if key[0] < 0 else {}
+                    stamp(key, 'post')
                     api.call('agent_move', match_id=key[0], leg=key[1], revision=key[2], move=move, **extra)
+                    stamp(key, 'posted')
                     submitted.add(key)
                     del jobs[key]
+                    entry = timings.pop(key, None)
+                    if timing_file is not None and entry is not None and all(k in entry for k in ('start', 'end', 'post', 'posted')):
+                        ms = lambda a, b: int(round((entry[b] - entry[a]) * 1000))
+                        try:
+                            timing_file.write('timing at=%.3f match=%d leg=%d rev=%d src=%s seen_to_queue=%d slot_wait=%d engine=%d '
+                                              'done_to_post=%d post=%d total=%d conn=%s\n' % (
+                                time.time(), key[0], key[1], key[2], entry['src'], ms('seen', 'queued'), ms('queued', 'start'),
+                                ms('start', 'end'), ms('end', 'post'), ms('post', 'posted'), ms('seen', 'posted'),
+                                'reused' if api.last_reused else 'new'))
+                        except OSError:
+                            pass
                 failures = 0
                 active = any(m.get('status') == 'running' for m in payload.get('matches', []))
                 if stream is not None and stream.healthy:
-                    delay = 10   # safety poll; the stream and engine answers wake us earlier
+                    # Safety poll only: stream events and engine answers wake us earlier. During a game keep 10s,
+                    # because one lost event in a short game could cost the clock; idle 60s.
+                    poll_every = 10 if active else 60
                 else:
-                    delay = 1 if active or busy else 5
+                    poll_every = 1 if active or busy else 5
+                delay = poll_every - (time.monotonic() - last_poll)
+                start = time.monotonic()
             except PermissionError:
                 print('Bot credential rejected. Stopping.', file=sys.stderr)
                 return 2
             except (RuntimeError, ValueError, KeyError, TypeError, urllib.error.URLError, OSError):
                 failures += 1
+                poll_now = True
                 print('Connection/state error; retrying without replaying an outdated move.', file=sys.stderr)
+                delay = min(30, 2 ** min(failures, 5)) + random.random()
+            except (KeyboardInterrupt, RuntimeLimit):
+                raise
+            except Exception as error:
+                # Never let an unexpected error (for example an http.client error while the server restarts,
+                # or an engine that fails to stop) end the connector: a stopped connector loses its games by disconnect.
+                failures += 1
+                poll_now = True
+                print('Unexpected %s; retrying.' % type(error).__name__, file=sys.stderr)
                 delay = min(30, 2 ** min(failures, 5)) + random.random()
             wake.wait(max(.05, delay - (time.monotonic() - start)))
     except RuntimeLimit:
@@ -870,6 +1042,8 @@ def main():
         executor.shutdown(wait=True, cancel_futures=True)
         for engine in engines_by_game.values():
             engine.stop()
+        if timing_file is not None:
+            timing_file.close()
 
 
 if __name__ == '__main__':
