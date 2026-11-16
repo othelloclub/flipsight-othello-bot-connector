@@ -619,6 +619,33 @@ def detect_cpu(cpu_name):
                 cpu = value
         except (OSError, subprocess.SubprocessError):
             pass
+    elif system == 'Linux':
+        # 시작할 때 한 번만 읽는다. 아키텍처 대신 커널이 보고한 CPU 제품명을 우선한다.
+        try:
+            with open('/proc/cpuinfo', encoding='utf-8', errors='replace') as info:
+                lines = info.read(65536).splitlines()
+            for line in lines:
+                key, separator, value = line.partition(':')
+                if separator and key.strip().lower() == 'model name' and value.strip():
+                    return ' '.join(value.split())[:120]
+        except OSError:
+            pass
+        # ARM이나 제한된 /proc 환경에서는 lscpu가 아는 모델명을 한 번만 확인한다.
+        try:
+            value = subprocess.check_output([
+                'lscpu', '--json'
+            ], encoding='utf-8', errors='replace', timeout=1, stderr=subprocess.DEVNULL,
+                env=dict(os.environ, LC_ALL='C'))
+            data = json.loads(value)
+            rows = data.get('lscpu', []) if isinstance(data, dict) else []
+            for row in rows if isinstance(rows, list) else []:
+                if not isinstance(row, dict):
+                    continue
+                value = row.get('data')
+                if str(row.get('field', '')).strip().rstrip(':') == 'Model name' and isinstance(value, str) and value.strip():
+                    return ' '.join(value.split())[:120]
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
     elif system == 'Darwin':
         try:
             value = subprocess.check_output(['sysctl', '-n', 'machdep.cpu.brand_string'], text=True, timeout=1).strip()
