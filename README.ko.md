@@ -43,11 +43,11 @@
 
    macOS / Linux:
    ```sh
-   python3 bot_match_client.py --engine 'python3 bot_match_example_engine.py'
+   python3 bot_match_client.py --engine-threads 1 --engine 'python3 bot_match_example_engine.py'
    ```
    Windows:
    ```powershell
-   py bot_match_client.py --engine 'py bot_match_example_engine.py'
+   py bot_match_client.py --engine-threads 1 --engine 'py bot_match_example_engine.py'
    ```
 6. 봇 목록에서 내 봇이 온라인으로 보이면, 다른 봇에게 직접 신청해 첫 대국을 시험해 보세요. 잘 되면 내 엔진으로 바꿉니다.
 
@@ -59,12 +59,14 @@
 | --- | --- | --- |
 | Edax | `--edax PATH` | `python3 bot_match_client.py --edax "edax/lEdax-x86-64"` |
 | Egaroucid for Console | `--egaroucid PATH` | `python3 bot_match_client.py --egaroucid "egaroucid/bin/Egaroucid_for_Console.out"` |
-| NBoard 방식 엔진(NTest 등) | `--nboard CMD` | `python3 bot_match_client.py --nboard "path/to/engine"` |
-| 직접 만든 엔진 | `--engine CMD` | `python3 bot_match_client.py --engine "python3 my_adapter.py"` |
+| NBoard 방식 엔진(NTest 등) | `--nboard CMD` | `python3 bot_match_client.py --engine-threads 2 --nboard "path/to/engine"` |
+| 직접 만든 엔진 | `--engine CMD` | `python3 bot_match_client.py --engine-threads 2 --engine "python3 my_adapter.py"` |
 
 연결기가 남은 제한 시간에서 수마다 생각할 시간을 나눠 줍니다. Edax, Egaroucid, NBoard 방식 연결은 일반 8x8 오델로만 지원합니다.
 
 `--engine-threads N` 을 붙이면 엔진이 게임 하나에 쓰는 스레드 수가 봇의 유저 기록에 표시됩니다. Edax, Egaroucid 는 이 값으로 엔진 스레드도 정합니다(기본은 논리 CPU 가 4개보다 많으면 4, 아니면 1). CPU 이름과 스레드는 나중에 봇 관리에서도 고칠 수 있습니다. `--engine` 에는 수마다 보내는 요청에 `engine_threads` 로도 실어 보내므로, 엔진이 이 값에 맞춰 탐색 스레드를 정할 수 있습니다. 연결기는 봇 관리의 동시 대국 수만큼 대국을 함께 생각합니다. 봇끼리 대국의 2판은 한 대국으로 세어 함께 생각하므로 봇끼리 대국 중에는 엔진이 하나 더 뜹니다. 게임당 스레드 × (동시 대국 수 + 1)이 CPU 스레드 수를 넘지 않게 정하세요.
+
+`--engine`·`--nboard`에서 `--engine-threads`를 생략하면 연결 전에 실제 게임당 스레드 수를 입력받습니다. 백그라운드·자동 실행에서는 옵션을 반드시 지정하세요. 입력값은 엔진의 실제 설정과 같아야 하며, 연결기가 자체 엔진의 스레드를 강제로 제한하지는 않습니다.
 
 묶음의 예제 엔진을 실행하면 연결기는 `example_engine=true`와 엔진 파일명을 보고합니다. 새로 시작한 봇전은 당시 엔진명과 예제 여부를 저장해 히스토리와 게임방에 표시하며, 나중에 엔진을 바꿔도 과거 표시를 바꾸지 않습니다. `practice=true`만으로는 예제 엔진이라고 판단하지 않습니다.
 

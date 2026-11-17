@@ -43,11 +43,11 @@
 
    macOS / Linux:
    ```sh
-   python3 bot_match_client.py --engine 'python3 bot_match_example_engine.py'
+   python3 bot_match_client.py --engine-threads 1 --engine 'python3 bot_match_example_engine.py'
    ```
    Windows:
    ```powershell
-   py bot_match_client.py --engine 'py bot_match_example_engine.py'
+   py bot_match_client.py --engine-threads 1 --engine 'py bot_match_example_engine.py'
    ```
 6. ボット一覧で自分のボットがオンラインになったら、他のボットに直接申し込んで最初の対局を試してみてください。うまく動いたら、自分のエンジンに切り替えます。
 
@@ -59,12 +59,14 @@
 | --- | --- | --- |
 | Edax | `--edax PATH` | `python3 bot_match_client.py --edax "edax/lEdax-x86-64"` |
 | Egaroucid for Console | `--egaroucid PATH` | `python3 bot_match_client.py --egaroucid "egaroucid/bin/Egaroucid_for_Console.out"` |
-| NBoard 方式のエンジン(NTest など) | `--nboard CMD` | `python3 bot_match_client.py --nboard "path/to/engine"` |
-| 自作エンジン | `--engine CMD` | `python3 bot_match_client.py --engine "python3 my_adapter.py"` |
+| NBoard 方式のエンジン(NTest など) | `--nboard CMD` | `python3 bot_match_client.py --engine-threads 2 --nboard "path/to/engine"` |
+| 自作エンジン | `--engine CMD` | `python3 bot_match_client.py --engine-threads 2 --engine "python3 my_adapter.py"` |
 
 接続プログラムが、残りの持ち時間から1手ごとの考慮時間を割り振ります。Edax、Egaroucid、NBoard 方式の接続は通常の 8x8 オセロだけに対応しています。
 
 `--engine-threads N` を付けると、エンジンが1局で使うスレッド数がボットのユーザー記録に表示されます。Edax、Egaroucid ではこの値でエンジンのスレッド数も決まります(既定は論理 CPU が4個より多ければ 4、それ以外は 1)。CPU 名とスレッド数は、あとからボット管理でも変更できます。 `--engine` では各リクエストに `engine_threads` としても入るので、エンジンはこの値に合わせて探索スレッドを決められます。接続プログラムはボット管理の同時対局数までの対局を同時に考えます。ボット同士の対戦の2局は1対局として数えて一緒に考えるので、対戦中はエンジンが1つ多く動きます。1局あたりのスレッド数 × (同時対局数 + 1) が CPU のスレッド数を超えないようにしてください。
+
+`--engine`・`--nboard`で `--engine-threads` を省略すると、接続前に実際の1局あたりのスレッド数を入力します。バックグラウンド・自動実行では必ず指定してください。入力値はエンジンの実際の設定に合わせてください。接続プログラムは自作エンジンのスレッド数を強制できません。
 
 同梱のサンプルエンジンを使うと、接続プログラムは `example_engine=true` とファイル名を送信します。新しいボット対戦では開始時のエンジン名とサンプルかどうかを保存し、履歴と対局室に表示します。あとでエンジンを変更しても過去の表示は変わりません。`practice=true` だけではサンプルエンジンとは判定しません。
 

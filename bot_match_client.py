@@ -725,6 +725,25 @@ def incoming_challenge(payload, my_id, selected=None):
     return None
 
 
+def resolve_engine_threads(args, parser):
+    if args.engine_threads is not None:
+        return args.engine_threads
+    if args.edax or args.egaroucid:
+        return 4 if (os.cpu_count() or 1) > 4 else 1
+    # Custom and generic NBoard engines cannot expose their allocation automatically.
+    # Never guess a thread count for them or silently report a default.
+    if sys.stdin is None or not sys.stdin.isatty():
+        parser.error('--engine-threads is required with --engine/--nboard in non-interactive mode')
+    while True:
+        try:
+            value = input('Engine threads per game: ').strip()
+        except (EOFError, KeyboardInterrupt):
+            parser.error('thread input cancelled; set --engine-threads to the actual engine thread count')
+        if value.isascii() and value.isdecimal() and len(value) <= 4 and 1 <= int(value) <= 1024:
+            return int(value)
+        print('Enter a whole number from 1 to 1024 matching the engine setting.', file=sys.stderr)
+
+
 MAX_SEARCHES = 8   # the site's highest max_games
 
 
@@ -744,7 +763,7 @@ def main():
     parser.add_argument('--engine-persistent', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--nboard-depth', type=int, default=0, help='Send "set depth N" to the NBoard engine (0 = engine default)')
     parser.add_argument('--engine-name', help='Reported engine name, without commands or paths')
-    parser.add_argument('--engine-threads', type=int, metavar='N', help='Engine threads per game, shown on the bot record. With --edax/--egaroucid it is also passed to the engine (default 4 when the computer has more than 4 logical CPUs, otherwise 1)')
+    parser.add_argument('--engine-threads', type=int, metavar='N', help='Actual engine threads per game, shown on the bot record. Required for unattended --engine/--nboard; prompted on a terminal if omitted. With --edax/--egaroucid it is also passed to the engine (default 4 when the computer has more than 4 logical CPUs, otherwise 1)')
     parser.add_argument('--cpu-name', help='Optional reported CPU model')
     parser.add_argument('--max-think-seconds', type=float, default=10, help='Optional per-turn cap; default 10s, 0 uses the remaining game clock')
     parser.add_argument('--once-match', type=int, help='Only process this match; exit when finished, aborted, expired or rejected')
@@ -766,9 +785,9 @@ def main():
     if args.engine_threads is not None and not 1 <= args.engine_threads <= 1024:
         parser.error('--engine-threads must be 1..1024')
     engine_name = args.engine_name or ('Edax' if args.edax else 'Egaroucid' if args.egaroucid else None)
-    # Threads per game: the connector sets them itself for Edax and Egaroucid (default 4 when the computer has more
-    # than 4 logical CPUs, otherwise 1); other engines report the value given here, if any.
-    threads = args.engine_threads or ((4 if (os.cpu_count() or 1) > 4 else 1) if (args.edax or args.egaroucid) else None)
+    # Resolve before creating engines or contacting the site; all modes must report a known allocation.
+    threads = resolve_engine_threads(args, parser)
+    args.engine_threads = threads
     environment = {'cpu': detect_cpu(args.cpu_name), 'engine': engine_name, 'os': platform.system(), 'example_engine': False}
     if threads:
         environment['engine_threads'] = threads

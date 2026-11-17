@@ -43,11 +43,11 @@ Full step-by-step guide in 23 languages: [FlipSight bot API docs](https://othell
 
    macOS / Linux:
    ```sh
-   python3 bot_match_client.py --engine 'python3 bot_match_example_engine.py'
+   python3 bot_match_client.py --engine-threads 1 --engine 'python3 bot_match_example_engine.py'
    ```
    Windows:
    ```powershell
-   py bot_match_client.py --engine 'py bot_match_example_engine.py'
+   py bot_match_client.py --engine-threads 1 --engine 'py bot_match_example_engine.py'
    ```
 6. When your bot shows as online in the bot list, challenge another bot to test your first game. Then switch to your own engine.
 
@@ -59,12 +59,14 @@ Games with the practice engine are not rated and are not picked for automatic ga
 | --- | --- | --- |
 | Edax | `--edax PATH` | `python3 bot_match_client.py --edax "edax/lEdax-x86-64"` |
 | Egaroucid for Console | `--egaroucid PATH` | `python3 bot_match_client.py --egaroucid "egaroucid/bin/Egaroucid_for_Console.out"` |
-| NBoard protocol engines (NTest and others) | `--nboard CMD` | `python3 bot_match_client.py --nboard "path/to/engine"` |
-| Your own engine | `--engine CMD` | `python3 bot_match_client.py --engine "python3 my_adapter.py"` |
+| NBoard protocol engines (NTest and others) | `--nboard CMD` | `python3 bot_match_client.py --engine-threads 2 --nboard "path/to/engine"` |
+| Your own engine | `--engine CMD` | `python3 bot_match_client.py --engine-threads 2 --engine "python3 my_adapter.py"` |
 
 The connector allocates thinking time for each move from the remaining game clock. Edax, Egaroucid and NBoard connections play standard 8x8 games.
 
 Add `--engine-threads N` to show how many threads your engine uses per game on your bot's record. With Edax and Egaroucid it also sets the engine's thread count (default 4 when the computer has more than 4 logical CPUs, otherwise 1). You can change the CPU name and threads later in bot management. With `--engine` the value is also sent as `engine_threads` in every request, so your engine can size its search to it. The connector thinks on as many games at once as your bot's max simultaneous games in bot management. The two boards of a bot match count as one game and think together, so a bot match runs one more engine; keep threads per game × (that number + 1) within your CPU threads.
+
+With `--engine` or `--nboard`, omitting `--engine-threads` prompts for the actual threads per game before connecting. For background or unattended runs, specify the option in the command. The reported value must match the engine configuration; the connector cannot enforce it for custom engines.
 
 When running the bundled example engine, the connector reports `example_engine=true` and its filename. New paired matches retain the engine name and example status from the start for history and room displays, even if the engine is changed later. `practice=true` alone does not identify an example engine.
 
