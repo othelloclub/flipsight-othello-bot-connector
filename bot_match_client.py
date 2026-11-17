@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = '1.4.4'
+VERSION = '1.4.5'
 WINDOWS = os.name == 'nt'
 DIRECTIONS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 # Temporary errors during a game: the first FAST_RETRIES tries wait 0.2-0.5s, later ones back off 2, 4, ... 30s.
@@ -831,6 +831,55 @@ def resolve_engine_threads(args, parser):
 MAX_SEARCHES = 8   # the site's highest max_games
 
 
+def configured_hash_mb(args):
+    """Configured hash-table capacity, not process RAM. Unknown engines remain unreported.
+
+    Edax 4.6 uses 24-byte entries in the main table plus two 1/16-size tables.
+    Egaroucid Console's fixed -hash 20 uses 2**20 32-byte entries.
+    An explicit report supports custom builds; it does not change engine settings.
+    """
+    if args.engine_hash_mb is not None:
+        return args.engine_hash_mb
+    if args.egaroucid:
+        return 32.0
+    if not args.edax:
+        return None
+    bits = 21
+    try:
+        with open('edax.ini', encoding='utf-8-sig') as stream:
+            text = stream.read(65537)
+        if len(text) > 65536:
+            return None
+        for line in text.splitlines():
+            words = line.split()
+            if words and words[0] == 'set':
+                words = words[1:]
+            if not words:
+                continue
+            if words[0] in ('o', 'option-file'):
+                return None  # Do not guess through nested option files.
+            if words[0] in ('h', 'hash-table-size'):
+                value = words[1:]
+                if value and value[0] == '=':
+                    value = value[1:]
+                bits = int(value[0])
+    except FileNotFoundError:
+        pass
+    except (OSError, UnicodeError, ValueError, IndexError):
+        return None
+    # Values above 25 depend on whether the actual engine binary is 32 or 64 bit.
+    return 27.0 * 2 ** (bits - 20) if 10 <= bits <= 25 else None
+
+
+def configured_ponder(args):
+    """The Edax adapter explicitly disables pondering; Console Egaroucid defaults to off.
+    Custom engines can optionally report their own setting without changing it.
+    """
+    if args.edax or args.egaroucid:
+        return False
+    return None if args.engine_ponder is None else args.engine_ponder == 'on'
+
+
 def main():
     parser = argparse.ArgumentParser(description='FlipSight bot connector')
     parser.add_argument('--api', default='https://othelloclub.com/flipsight/bot_match_api.php')
@@ -848,6 +897,8 @@ def main():
     parser.add_argument('--nboard-depth', type=int, default=0, help='Send "set depth N" to the NBoard engine (0 = engine default)')
     parser.add_argument('--engine-name', help='Reported engine name, without commands or paths')
     parser.add_argument('--engine-threads', type=int, metavar='N', help='Actual engine threads per game, shown on the bot record. Required for unattended --engine/--nboard; prompted on a terminal if omitted. With --edax/--egaroucid it is also passed to the engine (default 4 when the computer has more than 4 logical CPUs, otherwise 1)')
+    parser.add_argument('--engine-hash-mb', type=float, metavar='MB', help='Actual configured hash-table capacity per engine in MB (0..1048576); report only, does not configure engine memory. Optional for custom engines; Edax 4.6 and Egaroucid Console settings are reported automatically when known')
+    parser.add_argument('--engine-ponder', choices=('on', 'off'), help='Report the custom engine pondering setting without changing it; optional. Edax/Egaroucid adapters keep pondering off')
     parser.add_argument('--cpu-name', help='Optional reported CPU model')
     parser.add_argument('--max-think-seconds', type=float, default=10, help='Optional per-turn cap; default 10s, 0 uses the remaining game clock')
     parser.add_argument('--once-match', type=int, help='Only process this match; exit when finished, aborted, expired or rejected')
@@ -868,6 +919,10 @@ def main():
             parser.error('reported names must be at most 120 characters')
     if args.engine_threads is not None and not 1 <= args.engine_threads <= 1024:
         parser.error('--engine-threads must be 1..1024')
+    if args.engine_hash_mb is not None and (not math.isfinite(args.engine_hash_mb) or not 0 <= args.engine_hash_mb <= 1048576):
+        parser.error('--engine-hash-mb must be finite and 0..1048576')
+    if args.engine_ponder == 'on' and (args.edax or args.egaroucid):
+        parser.error('--engine-ponder on is for custom engines; the Edax/Egaroucid adapters keep pondering off')
     engine_name = args.engine_name or ('Edax' if args.edax else 'Egaroucid' if args.egaroucid else None)
     # Resolve before creating engines or contacting the site; all modes must report a known allocation.
     threads = resolve_engine_threads(args, parser)
@@ -875,6 +930,12 @@ def main():
     environment = {'cpu': detect_cpu(args.cpu_name), 'engine': engine_name, 'os': platform.system(), 'example_engine': False}
     if threads:
         environment['engine_threads'] = threads
+    hash_mb = configured_hash_mb(args)
+    if hash_mb is not None:
+        environment['hash_mb'] = hash_mb
+    ponder = configured_ponder(args)
+    if ponder is not None:
+        environment['ponder'] = ponder
     try:
         if args.edax:
             executable = native_executable(args.edax)
