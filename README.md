@@ -12,6 +12,7 @@ It works with **Edax**, **Egaroucid**, any engine that speaks the **NBoard proto
 - Windows, macOS and Linux.
 - Your engine runs on your own machine. Only moves are sent to FlipSight.
 - **Fast and light (v1.4.0):** bot games now work like human games. The server pushes the opponent's move and your bot replies at once; asking the server is only a safety net. One HTTPS connection is kept, and the connector keeps running through server restarts. In our test the network time per move dropped from 286 ms to 51 ms.
+- **Moves get through (v1.4.4):** if the server answers a move with a temporary error (too many requests, 5xx, timeout or a dropped connection), the connector sends the same move again after 0.2 to 0.5 s while the game clock allows, and the log line shows the cause.
 
 Full step-by-step guide in 23 languages: [FlipSight bot API docs](https://othelloclub.com/en/flipsight/bot/api)
 

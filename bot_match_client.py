@@ -12,8 +12,11 @@ The connector listens to the event stream (/flipsight_api/bot-stream) and reacts
 immediately. Events that carry this bot's own view (view "agent") update the last poll result in place, so the
 engine starts and its move is sent without another poll. agent_poll stays as the safety net: while the stream is up
 every 10s during a game and every 60s when idle, 1s/5s while the stream is down.
+A move that hits a temporary error (HTTP 429 or 5xx, timeout, connection error) is sent again within 0.2-0.5s while
+the game clock allows, honouring Retry-After; it is dropped only when the server state has moved on.
 """
 import argparse
+import email.utils
 import concurrent.futures
 import http.client
 import json
@@ -34,12 +37,88 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+VERSION = '1.4.4'
 WINDOWS = os.name == 'nt'
 DIRECTIONS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
+# Temporary errors during a game: the first FAST_RETRIES tries wait 0.2-0.5s, later ones back off 2, 4, ... 30s.
+FAST_RETRIES = 4
 
 
 class RuntimeLimit(Exception):
     pass
+
+
+class APIError(RuntimeError):
+    """A failed API call. status is the HTTP status (None for network errors). transient marks errors worth sending
+    the same request again right away: HTTP 429 and 5xx, timeouts and connection errors. retry_after is the server's
+    Retry-After in seconds, if any."""
+
+    def __init__(self, message, status=None, transient=False, retry_after=None):
+        super().__init__(message)
+        self.status, self.transient, self.retry_after = status, transient, retry_after
+
+
+def retry_after_seconds(headers):
+    """Retry-After as seconds (delta or HTTP date), capped at 120s; None when absent or unreadable."""
+    value = headers.get('Retry-After') if headers is not None else None
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            seconds = email.utils.parsedate_to_datetime(value).timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if not math.isfinite(seconds):
+        return None
+    return min(120.0, max(0.0, seconds))
+
+
+def http_error(status, headers):
+    return APIError('HTTP %d' % status, status, status == 429 or status >= 500, retry_after_seconds(headers))
+
+
+def network_error(error):
+    return APIError('%s: %s' % (type(error).__name__, error), None, True)
+
+
+def describe_error(error, token=''):
+    """One log line for an error: type, message and HTTP status, never the token or a response body."""
+    text = ' '.join(str(error).split())
+    if token:
+        text = text.replace(token, '[token]')
+    if not isinstance(error, APIError):
+        text = '%s: %s' % (type(error).__name__, text) if text else type(error).__name__
+    if getattr(error, 'retry_after', None) is not None:
+        text += ', Retry-After %.1fs' % error.retry_after
+    return text[:300]
+
+
+def retry_delay(tries, retry_after=None, clock_left=None):
+    """Seconds to wait before sending the same request again, or None when the game clock has run out.
+    The first FAST_RETRIES tries wait 0.2-0.5s, later ones back off as before, and Retry-After is followed.
+    With a game clock (clock_left seconds) no wait reaches it: waiting that long would lose on time for sure,
+    so the clock wins over Retry-After and the wait shrinks so one more try still lands in time."""
+    if tries <= FAST_RETRIES:
+        base = random.uniform(.2, .5)
+    else:
+        base = min(30, 2 ** min(tries - FAST_RETRIES, 5)) + random.random()
+    delay = base if retry_after is None else max(base, retry_after)
+    if clock_left is not None:
+        if clock_left < .1:
+            return None
+        if delay >= clock_left:
+            delay = min(base, clock_left / 2)
+    return delay
+
+
+def has_running_match(payload):
+    try:
+        return any(isinstance(m, dict) and m.get('status') == 'running' for m in payload.get('matches', []))
+    except AttributeError:
+        return False
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -81,7 +160,7 @@ class API:
             self.connection = None
 
     def post(self, body, headers):
-        """One POST on the kept connection. Returns (status, body)."""
+        """One POST on the kept connection. Returns (status, body, response headers)."""
         for attempt in (0, 1):
             reused = self.connection is not None
             if not reused:
@@ -93,7 +172,7 @@ class API:
                 if not response.isclosed() or response.will_close:
                     self.close()   # unread rest or server closes: start fresh next time
                 self.last_reused = reused
-                return response.status, data
+                return response.status, data, response.headers
             except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 self.close()
                 # The server closed an idle kept connection: send once more on a new one. A move cannot apply
@@ -110,15 +189,18 @@ class API:
         headers = {'Authorization': 'Bearer ' + self.token, 'Content-Type': 'application/json', 'Accept': 'application/json',
                    'User-Agent': 'Python-urllib/%d.%d' % sys.version_info[:2]}
         if self.keep_alive:
-            with self.lock:
-                status, body = self.post(body, headers)
+            try:
+                with self.lock:
+                    status, body, response_headers = self.post(body, headers)
+            except (OSError, http.client.HTTPException) as error:
+                raise network_error(error) from None
             # Never log response bodies: a proxy could echo the authorization header.
             if status in (401, 403):
                 raise PermissionError('authentication denied')
             if 300 <= status < 400:
                 raise RuntimeError('redirect refused')
             if status >= 400:
-                raise RuntimeError('HTTP ' + str(status))
+                raise http_error(status, response_headers)
         else:
             request = urllib.request.Request(self.url, data=body, headers=headers, method='POST')
             try:
@@ -128,7 +210,9 @@ class API:
                 # Never log response bodies: a proxy could echo the authorization header.
                 if error.code in (401, 403):
                     raise PermissionError('authentication denied') from None
-                raise RuntimeError('HTTP ' + str(error.code)) from None
+                raise http_error(error.code, error.headers) from None
+            except (OSError, http.client.HTTPException) as error:
+                raise network_error(error) from None
             self.last_reused = False
         if len(body) > 1024 * 1024:
             raise RuntimeError('response too large')
@@ -898,8 +982,12 @@ def main():
         return engine.move(request, deadline, cancel)
 
     jobs, submitted, failed = {}, set(), set()
+    # Moves the server has not received yet: turn key -> {'at': next try, 'tries': n} for temporary errors,
+    # the local time each turn's clock runs out (never wait past it), and every turn whose send failed once.
+    move_retry, clock_end, undelivered = {}, {}, set()
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_SEARCHES + 1)   # + the second board of a bot match
     failures = 0
+    poll_failures, poll_not_before = 0, 0.0   # a failed poll while a move waits is retried on its own schedule
     # The last agent_poll result, kept current with view "agent" stream events, and the server clock behind it
     # (server_now_ms and the local time it was taken) so remaining clocks are computed for "now".
     base, server_clock = None, None
@@ -951,15 +1039,29 @@ def main():
                             server_clock = (now_ms, time.monotonic())
                     else:
                         poll_now = True
-                if poll_now or base is None or last_poll is None or time.monotonic() - last_poll >= poll_every:
+                poll_due = poll_now or base is None or last_poll is None or time.monotonic() - last_poll >= poll_every
+                if poll_due and (base is None or time.monotonic() >= poll_not_before):
                     poll_now = True   # stays set if the poll fails, so the next round polls again
-                    base = api.call('agent_poll', environment=environment, history='brief')
-                    last_poll, poll_now = time.monotonic(), False
-                    for polled in base.get('matches', []):
-                        if isinstance(polled, dict) and polled.get('status') == 'running':
-                            seen[polled.get('id')] = ('poll', last_poll)
-                    now_ms = base.get('server_now_ms')
-                    server_clock = (now_ms, last_poll) if type(now_ms) in (int, float) else None
+                    try:
+                        polled_base = api.call('agent_poll', environment=environment, history='brief')
+                    except APIError as error:
+                        # A finished move must not wait behind a failing poll: send it from the last known state
+                        # (the server checks the revision) and poll again on its own short schedule.
+                        if not (error.transient and base is not None and any(f.done() for f, _ in jobs.values())):
+                            raise
+                        poll_failures += 1
+                        wait = retry_delay(poll_failures, error.retry_after)
+                        poll_not_before = time.monotonic() + wait
+                        print('Poll failed (%s); sending the finished move from the last known state, next poll in %.2fs.'
+                              % (describe_error(error, api.token), wait), file=sys.stderr)
+                    else:
+                        base, poll_failures, poll_not_before = polled_base, 0, 0.0
+                        last_poll, poll_now = time.monotonic(), False
+                        for polled in base.get('matches', []):
+                            if isinstance(polled, dict) and polled.get('status') == 'running':
+                                seen[polled.get('id')] = ('poll', last_poll)
+                        now_ms = base.get('server_now_ms')
+                        server_clock = (now_ms, last_poll) if type(now_ms) in (int, float) else None
                 payload = base
                 if server_clock is not None:
                     payload['server_now_ms'] = server_clock[0] + int((time.monotonic() - server_clock[1]) * 1000)
@@ -983,10 +1085,17 @@ def main():
                 turns = current_turns(payload, my_id)
                 for key, (future, cancel) in list(jobs.items()):
                     if key not in turns:
+                        if key in undelivered:
+                            print('Server state moved on for match %s leg %s (revision %s); dropping the outdated move.'
+                                  % key[:3], file=sys.stderr)
                         cancel.set()
                         future.cancel()
                         del jobs[key]
                         timings.pop(key, None)
+                for key in [k for k in set(move_retry) | set(clock_end) | undelivered if k not in jobs]:
+                    move_retry.pop(key, None)
+                    clock_end.pop(key, None)
+                    undelivered.discard(key)
                 active_games = {(int(m['id']), i, m.get('round_no'), m.get('room_created_at'))
                                 for m in payload.get('matches', []) if m.get('status') == 'running'
                                 for i, _ in enumerate((m.get('state') or {}).get('legs', [])[:2])}
@@ -1018,6 +1127,7 @@ def main():
                         future = executor.submit(run_engine, request, queued_at + budget, cancel, queued_at, key)
                         future.add_done_callback(lambda _f: wake.set())   # submit as soon as the engine answers
                         jobs[key] = (future, cancel)
+                        clock_end[key] = queued_at + request['remaining_ms'] / 1000
                     future, _ = jobs[key]
                     if not future.done():
                         busy = True
@@ -1030,13 +1140,45 @@ def main():
                         del jobs[key]
                         timings.pop(key, None)
                         continue
+                    retry = move_retry.get(key)
+                    if retry is not None and time.monotonic() < retry['at']:
+                        busy = True
+                        continue
                     # If the response is lost, the next poll observes the revision. Otherwise retry
                     # the exact move with the same expected revision; never compute twice.
                     # Human matches (negative id) also need the room's round and creation time.
                     extra = {'round_no': key[3], 'room_created_at': key[4]} if key[0] < 0 else {}
                     stamp(key, 'post')
-                    api.call('agent_move', match_id=key[0], leg=key[1], revision=key[2], move=move, **extra)
+                    try:
+                        api.call('agent_move', match_id=key[0], leg=key[1], revision=key[2], move=move, **extra)
+                    except Exception as error:
+                        undelivered.add(key)
+                        if not (isinstance(error, APIError) and error.transient):
+                            raise   # for example 409: the next poll shows whether the state moved on
+                        # A temporary error (429, 5xx, timeout, connection): send the same move again almost at once,
+                        # without waiting for a poll. The game and revision are unchanged as far as we know.
+                        tries = (retry or {}).get('tries', 0) + 1
+                        wait = retry_delay(tries, error.retry_after, clock_end.get(key, 0) - time.monotonic())
+                        if wait is None:
+                            print('Move for match %s leg %s revision %s not delivered (%s); the game clock runs out before '
+                                  'another try.' % (key[0], key[1], key[2], describe_error(error, api.token)), file=sys.stderr)
+                            failed.add(key)
+                            del jobs[key]
+                            timings.pop(key, None)
+                            poll_now = True
+                            continue
+                        move_retry[key] = {'at': time.monotonic() + wait, 'tries': tries}
+                        print('Move for match %s leg %s revision %s not delivered (%s); sending it again in %.2fs (try %d).'
+                              % (key[0], key[1], key[2], describe_error(error, api.token), wait, tries + 1), file=sys.stderr)
+                        busy = True
+                        continue
                     stamp(key, 'posted')
+                    if retry is not None:
+                        print('Move for match %s leg %s revision %s delivered on try %d.' % (key[0], key[1], key[2], retry['tries'] + 1),
+                              file=sys.stderr)
+                    move_retry.pop(key, None)
+                    clock_end.pop(key, None)
+                    undelivered.discard(key)
                     submitted.add(key)
                     del jobs[key]
                     entry = timings.pop(key, None)
@@ -1058,16 +1200,30 @@ def main():
                     poll_every = 10 if active else 60
                 else:
                     poll_every = 1 if active or busy else 5
-                delay = poll_every - (time.monotonic() - last_poll)
+                now = time.monotonic()
+                delay = poll_every - (now - last_poll)
+                if poll_now or delay <= 0:
+                    delay = max(delay, poll_not_before - now)   # a due poll may be held back after a failure
+                if move_retry:
+                    delay = min(delay, min(r['at'] for r in move_retry.values()) - now)
                 start = time.monotonic()
             except PermissionError:
                 print('Bot credential rejected. Stopping.', file=sys.stderr)
                 return 2
-            except (RuntimeError, ValueError, KeyError, TypeError, urllib.error.URLError, OSError):
+            except (RuntimeError, ValueError, KeyError, TypeError, urllib.error.URLError, OSError) as error:
                 failures += 1
                 poll_now = True
-                print('Connection/state error; retrying without replaying an outdated move.', file=sys.stderr)
-                delay = min(30, 2 ** min(failures, 5)) + random.random()
+                retry_after = getattr(error, 'retry_after', None)
+                # During a game a temporary error, or a 409 (the server state may have moved on), is followed by a quick
+                # poll: 0.2-0.5s for the first tries, then 2, 4, ... 30s. Idle errors back off as before.
+                if isinstance(error, APIError) and (error.transient or error.status == 409) and has_running_match(base):
+                    delay = retry_delay(failures, retry_after)
+                else:
+                    delay = min(30, 2 ** min(failures, 5)) + random.random()
+                    if retry_after is not None:
+                        delay = max(delay, retry_after)
+                print('Connection/state error (%s); retrying in %.2fs without replaying an outdated move.'
+                      % (describe_error(error, api.token), delay), file=sys.stderr)
             except (KeyboardInterrupt, RuntimeLimit):
                 raise
             except Exception as error:
@@ -1075,8 +1231,8 @@ def main():
                 # or an engine that fails to stop) end the connector: a stopped connector loses its games by disconnect.
                 failures += 1
                 poll_now = True
-                print('Unexpected %s; retrying.' % type(error).__name__, file=sys.stderr)
                 delay = min(30, 2 ** min(failures, 5)) + random.random()
+                print('Unexpected error (%s); retrying in %.2fs.' % (describe_error(error, api.token), delay), file=sys.stderr)
             wake.wait(max(.05, delay - (time.monotonic() - start)))
     except RuntimeLimit:
         print('Runtime limit reached; stopping connector and engines.', file=sys.stderr)
