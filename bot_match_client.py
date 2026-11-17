@@ -5,12 +5,14 @@ Credentials stay in FS_BOT_TOKEN. Engine modes:
   --engine CMD   a long-running JSON-lines engine, one process per game: read a request line,
                  write one {"move": index} line, repeat (do not wait for end of input)
   --nboard CMD   a long-running engine that speaks the NBoard protocol (one engine per leg)
-  --edax PATH    Edax 4.6 executable; NBoard setup and per-turn time allocation are automatic
+  --edax PATH    Edax 4.6 executable over xboard: Edax runs its own game clock (the connector sends both
+                 clocks before every search) and keeps its game and hash table through the leg
+                 --edax-protocol nboard keeps the older NBoard connection (per-turn time set by the connector)
   --egaroucid PATH  Egaroucid for Console 7.8.2; native setboard/settime/go commands
                  --egaroucid-level N (1..60) plays a fixed level instead (no settime)
   --engine-hash-mb MB sets the Edax/Egaroucid hash table (largest power-of-two size not above MB) and
-  --engine-ponder on starts Egaroucid with -ponder; both report the actual setting. Edax 4.6 does not ponder in
-  NBoard mode. With other engines both options only report the setting.
+  --engine-ponder on lets Edax (xboard) and Egaroucid (-ponder) think in the opponent's time; both report the
+  actual setting. With other engines both options only report the setting.
 The connector listens to the event stream (/flipsight_api/bot-stream) and reacts to opponent moves
 immediately. Events that carry this bot's own view (view "agent") update the last poll result in place, so the
 engine starts and its move is sent without another poll. agent_poll stays as the safety net: while the stream is up
@@ -40,7 +42,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = '1.4.7'
+VERSION = '1.4.8'
 WINDOWS = os.name == 'nt'
 DIRECTIONS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 # Temporary errors during a game: the first FAST_RETRIES tries wait 0.2-0.5s, later ones back off 2, 4, ... 30s.
@@ -408,7 +410,8 @@ class PersistentJsonEngine:
                     self.process = start_process(self.command, engine_env())
                     self.lines = queue.Queue()
                     threading.Thread(target=line_reader, args=(self.process, self.lines), daemon=True).start()
-                self.process.stdin.write((json.dumps(request) + '\n').encode())
+                # Keys starting with "_" are the connector's own (for the Edax adapter), not part of the JSON protocol.
+                self.process.stdin.write((json.dumps({k: v for k, v in request.items() if not k.startswith('_')}) + '\n').encode())
                 self.process.stdin.flush()
             try:
                 launch_and_send()
@@ -550,8 +553,9 @@ def native_executable(path):
     return os.path.abspath(found)
 
 
-class EdaxEngine(NBoardEngine):
-    """Edax 4.6: ping stops its search and returns the last completed result."""
+class EdaxNBoardEngine(NBoardEngine):
+    """Edax 4.6 over NBoard (--edax-protocol nboard, before v1.4.8): the connector gives every turn its time and
+    ping stops the search, which returns the last completed result."""
 
     def __init__(self, command, depth=0):
         super().__init__(command, depth or 60)
@@ -605,6 +609,176 @@ class EdaxEngine(NBoardEngine):
             except BaseException:
                 self.stop()
                 raise
+
+
+def play_square(board, color, square):
+    """The 8x8 board after color plays square (row-major from a1 = 0)."""
+    result = list(board)
+    row, col = divmod(square, 8)
+    for dr, dc in DIRECTIONS:
+        r, c, line = row + dr, col + dc, []
+        while 0 <= r < 8 and 0 <= c < 8 and result[r * 8 + c] == 3 - color:
+            line.append(r * 8 + c)
+            r, c = r + dr, c + dc
+        if line and 0 <= r < 8 and 0 <= c < 8 and result[r * 8 + c] == color:
+            for flipped in line:
+                result[flipped] = color
+    result[square] = color
+    return result
+
+
+def xboard_square(square):
+    return '@@@@' if square == -1 else 'abcdefgh'[square % 8] + str(square // 8 + 1)
+
+
+def edax_xboard_fen(board, me):
+    """Edax's xboard FEN with Edax to move. Edax stones are always the lowercase side 'p' with 'b' to move, so Edax
+    plays its internal first colour in every leg: the clock slot that "time" fills after "new" and "force" (see EdaxEngine).
+    Rows run 8..1 and a..h, as in Edax's board_from_FEN; colours do not matter to Edax's search or book."""
+    rows = []
+    for r in range(7, -1, -1):
+        text, empty = '', 0
+        for value in board[r * 8:r * 8 + 8]:
+            if not value:
+                empty += 1
+                continue
+            if empty:
+                text, empty = text + str(empty), 0
+            text += 'p' if value == me else 'P'
+        rows.append(text + (str(empty) if empty else ''))
+    return '/'.join(rows) + ' b'
+
+
+class EdaxOutOfStep(Exception):
+    """Edax's own game no longer matches the server (it rejected a move or answered for another position)."""
+
+
+# Clock kept back from the time sent to Edax for network and connector delays (as in thinking_budget). Edax keeps
+# its own margin on top: 1s above 10s left, 10s above 60s left.
+EDAX_CLOCK_RESERVE_MS = 750
+
+
+class EdaxEngine(NBoardEngine):
+    """Edax 4.6 over xboard, one process per leg (v1.4.8). Edax runs its own clock: before every search the connector
+    sends "time" (this bot's site clock less EDAX_CLOCK_RESERVE_MS) and "otim" (the opponent's), in centiseconds.
+
+    The leg starts with new, level (the site's game time), force, easy/hard, setboard and go. After that one opponent
+    move is sent as "usermove" (a pass as @@@@) and Edax answers by itself, keeping its game, hash table and, with
+    ponder on, its search in the opponent's time. Several plies at once (for example around a pass) go in force mode
+    and end with go; a position that does not follow from Edax's game by the server history is set again with setboard.
+
+    Clock slots: "time" fills Edax's own slot (edax_turn), or after "force" the slot it had before (last_edax_turn).
+    "new" leaves edax_turn on Edax's internal first colour and setboard always gives Edax that colour (edax_xboard_fen),
+    so "force" is never sent twice in a row and every "time" lands on Edax's own clock.
+
+    Safety: if no move comes by the connector's per-turn limit, "?" makes Edax play its best move at once; if that
+    also does not arrive the process is stopped, as before.
+    """
+
+    def __init__(self, command, depth=0, ponder=False):
+        super().__init__(command, depth)
+        self.ponder = ponder
+        self.known = None   # (board, colour to move, history entries) of Edax's own game; None: set the board
+
+    def stop(self):
+        super().stop()
+        self.known = None
+
+    def _send(self, *lines):
+        self.process.stdin.write(''.join(line + '\n' for line in lines).encode())
+        self.process.stdin.flush()
+
+    def _start(self, request):
+        self.process = start_process(self.command, engine_env())
+        self.lines = queue.Queue()
+        self.known = None
+        threading.Thread(target=line_reader, args=(self.process, self.lines), daemon=True).start()
+        # Without "level" Edax keeps its fixed-depth default; level 0 M:SS 0 is time per game (the site has no increment).
+        seconds = max(1, -(-(request.get('_time_limit_ms') or request['remaining_ms']) // 1000))
+        self._send('xboard', 'protover 2', 'new', 'level 0 %d:%02d 0' % divmod(seconds, 60),
+                   *(['sd %d' % self.depth] if self.depth else []))
+
+    def _plies(self, request):
+        """Moves from Edax's own game to the requested position by the server history, or None to set the board."""
+        if self.known is None:
+            return None
+        board, color, count = self.known
+        history = request.get('history')
+        if not isinstance(history, list) or len(history) <= count:
+            return None
+        plies = []
+        for entry in history[count:]:
+            move = entry.get('move') if isinstance(entry, dict) else None
+            if type(move) is not int or entry.get('color') != color:
+                return None
+            legal = legal_moves(board, color)
+            if move == -1:
+                if legal:
+                    return None
+            elif move in legal:
+                board = play_square(board, color, move)
+            else:
+                return None
+            plies.append(move)
+            color = 3 - color
+        return plies if board == request['board'] and color == request['color'] else None
+
+    def move(self, request, deadline, cancel):
+        standard_request(request)
+        legal = request['legal_moves']
+        if not legal:
+            return -1   # the history replay gives Edax this pass with the next opponent move
+        with self.lock:
+            started = time.monotonic()
+            for attempt in (0, 1):
+                try:
+                    if cancel.is_set() or time.monotonic() >= deadline:
+                        raise TimeoutError('search cancelled before launch')
+                    if self.process is None or self.process.poll() is not None:
+                        self.stop()
+                        self._start(request)
+                    # ping/pong also drops any output left from earlier searches or pondering.
+                    self.ping += 1
+                    tag = 'pong %d' % self.ping
+                    self._send('ping %d' % self.ping)
+                    self._read_until(lambda t: True if t == tag else None, deadline, cancel)
+                    mine = request['remaining_ms'] - EDAX_CLOCK_RESERVE_MS - int((time.monotonic() - started) * 1000)
+                    clocks = ('time %d' % max(0, mine // 10), 'otim %d' % (request.get('_opponent_ms', 0) // 10))
+                    plies = self._plies(request)
+                    if plies is not None and len(plies) == 1:
+                        commands = clocks + ('usermove ' + xboard_square(plies[0]),)   # Edax moves on its own
+                    elif plies:
+                        commands = ('force',) + tuple('usermove ' + xboard_square(m) for m in plies) + clocks + ('go',)
+                    else:
+                        # setboard also stops any pondering that "hard" starts in force mode.
+                        commands = ('force', 'hard' if self.ponder else 'easy',
+                                    'setboard ' + edax_xboard_fen(request['board'], request['color'])) + clocks + ('go',)
+                    self._send(*commands)
+                    def accept(text):
+                        if text.startswith('Illegal move'):
+                            raise EdaxOutOfStep('Edax rejected a move')
+                        return text[5:].strip() if text.startswith('move ') else None
+                    soft_deadline = deadline - min(.2, max(0, deadline - time.monotonic()) * .25)
+                    try:
+                        reply = self._read_until(accept, soft_deadline, cancel)
+                    except TimeoutError:
+                        self._send('?')   # play now: Edax stops and plays its best move so far
+                        reply = self._read_until(accept, deadline, cancel)
+                    reply = reply[2:] if reply[:2].lower() == 'p@' else reply
+                    move = -1 if reply == '@@@@' else square_index(reply)
+                    if move not in legal:
+                        raise EdaxOutOfStep('Edax answered for another position')
+                    self.known = (play_square(request['board'], request['color'], move), 3 - request['color'],
+                                  len(request.get('history') or []) + 1)
+                    return move
+                except EdaxOutOfStep:
+                    # Start again from the server position once; a second mismatch is an engine failure.
+                    self.stop()
+                    if attempt:
+                        raise RuntimeError('Edax does not follow the game')
+                except BaseException:
+                    self.stop()
+                    raise
 
 
 class EgaroucidEngine(NBoardEngine):
@@ -775,6 +949,7 @@ def current_turns(payload, my_id):
             if len(clocks) != 2:
                 raise ValueError('invalid clocks received')
             remaining = max(0, int(clocks[color - 1]))
+            limit = state.get('time_limit_sec', match.get('time_limit_sec'))
             if type(now) in (int, float) and type(leg.get('turn_started_ms')) in (int, float):
                 remaining = max(0, remaining - max(0, int(now - leg['turn_started_ms'])))
             key = (int(match['id']), leg_index, int(leg['revision']), match.get('round_no'), match.get('room_created_at'))
@@ -785,7 +960,10 @@ def current_turns(payload, my_id):
             turns[key] = {'board': board, 'color': color, 'legal_moves': legal, 'game_mode':mode,'board_size':n,
                 'blocked_squares':state.get('blocked_squares',[]),'placed':leg.get('placed',{}),'remaining_ms': remaining,
                 'match_id': key[0], 'leg': key[1], 'revision': key[2], 'history': leg.get('history', []),
-                'round_no': match.get('round_no'), 'room_created_at': match.get('room_created_at')}
+                'round_no': match.get('round_no'), 'room_created_at': match.get('room_created_at'),
+                # For the Edax xboard adapter only (never sent to JSON engines): the opponent's clock and the game time.
+                '_opponent_ms': max(0, int(clocks[2 - color])),
+                '_time_limit_ms': max(0, int(limit)) * 1000 if type(limit) in (int, float) else None}
     return turns
 
 
@@ -919,12 +1097,12 @@ def configured_hash_mb(args):
 
 
 def configured_ponder(args):
-    """Egaroucid Console ponders with -ponder (--engine-ponder on). Edax 4.6 never ponders in NBoard
-    mode (its NBoard loop does not start a ponder search), so the Edax adapter reports off.
-    Custom engines can optionally report their own setting without changing it.
+    """Egaroucid Console ponders with -ponder and Edax over xboard with -ponder on and "hard" (--engine-ponder on).
+    Edax 4.6 never ponders in NBoard mode (its NBoard loop does not start a ponder search), so --edax-protocol nboard
+    reports off. Custom engines can optionally report their own setting without changing it.
     """
     if args.edax:
-        return False
+        return args.edax_protocol == 'xboard' and args.engine_ponder == 'on'
     if args.egaroucid:
         return args.engine_ponder == 'on'
     return None if args.engine_ponder is None else args.engine_ponder == 'on'
@@ -938,17 +1116,18 @@ def main():
     engines = parser.add_mutually_exclusive_group(required=True)
     engines.add_argument('--engine', help='Local command, one process per game: repeatedly read one JSON request line and write one {"move": index} line')
     engines.add_argument('--nboard', help='Local command of an engine that speaks the NBoard protocol (kept running)')
-    engines.add_argument('--edax', metavar='PATH', help='Edax 4.6 executable; automatic NBoard setup and time allocation (standard 8x8 only)')
+    engines.add_argument('--edax', metavar='PATH', help='Edax 4.6 executable over xboard: Edax runs its own game clock and keeps its game and hash table through the leg (standard 8x8 only)')
     engines.add_argument('--egaroucid', metavar='PATH', help='Egaroucid for Console 7.8.2 executable; native console with game time control (standard 8x8 only)')
     parser.add_argument('--egaroucid-level', type=int, default=0, metavar='N', help='With --egaroucid: play Egaroucid level N (1..60) instead of game time control; 0 keeps time control. The per-turn cap still applies')
     parser.add_argument('--edax-eval', metavar='PATH', help='With --edax: eval.dat path; default is data/eval.dat beside the executable or its parent')
+    parser.add_argument('--edax-protocol', choices=('xboard', 'nboard'), default='xboard', help='With --edax: xboard (default since v1.4.8) or nboard, the connection used before v1.4.8 (the connector sets each turn\'s time; no pondering)')
     # Since 2026-11-13 --engine always keeps one process per game. The old flag is accepted and ignored so existing commands keep working.
     parser.add_argument('--engine-persistent', action='store_true', help=argparse.SUPPRESS)
-    parser.add_argument('--nboard-depth', type=int, default=0, help='Send "set depth N" to the NBoard engine (0 = engine default)')
+    parser.add_argument('--nboard-depth', type=int, default=0, help='Send "set depth N" to the NBoard engine, or "sd N" to Edax over xboard (0 = engine default)')
     parser.add_argument('--engine-name', help='Reported engine name, without commands or paths')
     parser.add_argument('--engine-threads', type=int, metavar='N', help='Actual engine threads per game, shown on the bot record. Required for unattended --engine/--nboard; prompted on a terminal if omitted. With --edax/--egaroucid it is also passed to the engine (default 4 when the computer has more than 4 logical CPUs, otherwise 1)')
     parser.add_argument('--engine-hash-mb', type=float, metavar='MB', help='Hash-table capacity per engine in MB. With --edax/--egaroucid it sets the table to the largest power-of-two size not above MB (Edax -h, Egaroucid -hash) and reports that size; without it Edax keeps edax.ini and Egaroucid uses 32 MB. For other engines it is report only (0..1048576)')
-    parser.add_argument('--engine-ponder', choices=('on', 'off'), help='With --egaroucid, on starts Egaroucid with -ponder (it keeps searching during the opponent\'s time). Edax 4.6 cannot ponder in NBoard mode. For other engines it only reports the setting')
+    parser.add_argument('--engine-ponder', choices=('on', 'off'), help='With --edax or --egaroucid, on lets the engine keep searching during the opponent\'s time (Edax -ponder on and "hard", Egaroucid -ponder); default off. Edax cannot ponder with --edax-protocol nboard. For other engines it only reports the setting')
     parser.add_argument('--cpu-name', help='Optional reported CPU model')
     parser.add_argument('--max-think-seconds', type=float, default=10, help='Optional per-turn cap; default 10s, 0 uses the remaining game clock')
     parser.add_argument('--once-match', type=int, help='Only process this match; exit when finished, aborted, expired or rejected')
@@ -958,6 +1137,8 @@ def main():
     args = parser.parse_args()
     if args.edax_eval and not args.edax:
         parser.error('--edax-eval requires --edax')
+    if args.edax_protocol != 'xboard' and not args.edax:
+        parser.error('--edax-protocol requires --edax')
     if args.nboard_depth and not (args.nboard or args.edax):
         parser.error('--nboard-depth requires --nboard or --edax')
     if args.egaroucid_level and not args.egaroucid:
@@ -971,8 +1152,8 @@ def main():
         parser.error('--engine-threads must be 1..1024')
     if args.engine_hash_mb is not None and (not math.isfinite(args.engine_hash_mb) or not 0 <= args.engine_hash_mb <= 1048576):
         parser.error('--engine-hash-mb must be finite and 0..1048576')
-    if args.engine_ponder == 'on' and args.edax:
-        parser.error('--engine-ponder on is not available with --edax: Edax 4.6 does not ponder in NBoard mode')
+    if args.engine_ponder == 'on' and args.edax and args.edax_protocol == 'nboard':
+        parser.error('--engine-ponder on is not available with --edax-protocol nboard: Edax 4.6 does not ponder in NBoard mode')
     engine_name = args.engine_name or ('Edax' if args.edax else 'Egaroucid' if args.egaroucid else None)
     # Resolve before creating engines or contacting the site; all modes must report a known allocation.
     threads = resolve_engine_threads(args, parser)
@@ -996,7 +1177,9 @@ def main():
             evaluation = next((os.path.abspath(os.path.expanduser(p)) for p in candidates if os.path.isfile(os.path.expanduser(p))), None)
             if not evaluation:
                 raise ValueError('Edax eval.dat not found; specify --edax-eval PATH')
-            command = [executable, '-nboard', '-eval-file', evaluation, '-n-tasks', str(threads), '-ponder', 'off'] + (hash_args or [])
+            xboard = args.edax_protocol == 'xboard'
+            command = [executable, '-xboard' if xboard else '-nboard', '-eval-file', evaluation, '-n-tasks', str(threads),
+                       '-ponder', 'on' if xboard and args.engine_ponder == 'on' else 'off'] + (hash_args or [])
         elif args.egaroucid:
             command = [native_executable(args.egaroucid), '-quiet', '-noboard', '-thread', str(threads)] + (hash_args or ['-hash', '20'])
             if args.engine_ponder == 'on':
@@ -1092,7 +1275,8 @@ def main():
             raise TimeoutError('queued search cancelled or expired')
         if args.engine_threads:
             request['engine_threads'] = args.engine_threads   # engines may size their search to this
-        factory = (lambda: EdaxEngine(command, args.nboard_depth)) if args.edax else (
+        factory = (lambda: EdaxEngine(command, args.nboard_depth, args.engine_ponder == 'on') if args.edax_protocol == 'xboard'
+                   else EdaxNBoardEngine(command, args.nboard_depth)) if args.edax else (
             (lambda: EgaroucidEngine(command, args.egaroucid_level)) if args.egaroucid else (
             (lambda: NBoardEngine(command, args.nboard_depth)) if args.nboard else (
             (lambda: PersistentJsonEngine(command, report_engine_environment)))))

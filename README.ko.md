@@ -13,6 +13,7 @@
 - 엔진은 내 컴퓨터에서 돕니다. FlipSight 로는 두는 수만 보냅니다.
 - **빠르고 가벼움(v1.4.0):** 봇 대국도 사람끼리 대국처럼, 상대가 두면 서버가 그 수를 바로 보내 주고 봇은 받자마자 둡니다. 서버에 상태를 묻는 요청은 놓친 것을 잡는 안전망으로만 씁니다. HTTPS 연결 하나를 계속 쓰고, 서버가 재시작해도 꺼지지 않고 다시 붙습니다. 우리 시험에서 한 수 통신 시간이 286ms 에서 51ms 로 줄었습니다.
 - **일시 오류에도 착수(v1.4.4):** 서버가 착수에 일시 오류(요청 과다, 5xx, 시간 초과, 연결 끊김)로 답하면 남은 시계 안에서 같은 수를 0.2~0.5초 뒤 다시 보내고, 기록 줄에 원인을 남깁니다.
+- **Edax 가 자기 시계로(v1.4.8):** `--edax` 가 xboard 방식으로 연결합니다. 생각할 시간은 Edax 가 양쪽 대국 시계를 보고 정하고, 판 안에서는 기보와 해시를 이어 쓰며, `--engine-ponder on` 이면 상대 차례에도 탐색합니다. 예전 NBoard 연결은 `--edax-protocol nboard` 로 쓸 수 있습니다.
 
 처음 하는 사람을 위한 자세한 안내(23개 언어): [FlipSight 봇 API 문서](https://othelloclub.com/flipsight/bot/api)
 
@@ -63,7 +64,7 @@
 | NBoard 방식 엔진(NTest 등) | `--nboard CMD` | `python3 bot_match_client.py --engine-threads 2 --nboard "path/to/engine"` |
 | 직접 만든 엔진 | `--engine CMD` | `python3 bot_match_client.py --engine-threads 2 --engine "python3 my_adapter.py"` |
 
-연결기가 남은 제한 시간에서 수마다 생각할 시간을 나눠 줍니다. Edax, Egaroucid, NBoard 방식 연결은 일반 8x8 오델로만 지원합니다.
+Edax 와 Egaroucid 는 연결기가 수마다 보내는 대국 시계를 보고 생각할 시간을 스스로 정합니다(Edax 는 v1.4.8 부터 xboard 방식). NBoard 방식 엔진은 `--max-think-seconds` 안에서 엔진 설정대로 탐색합니다. Edax, Egaroucid, NBoard 방식 연결은 일반 8x8 오델로만 지원합니다.
 
 `--engine-threads N` 을 붙이면 엔진이 게임 하나에 쓰는 스레드 수가 봇의 유저 기록에 표시됩니다. Edax, Egaroucid 는 이 값으로 엔진 스레드도 정합니다(기본은 논리 CPU 가 4개보다 많으면 4, 아니면 1). CPU 이름과 스레드는 나중에 봇 관리에서도 고칠 수 있습니다. `--engine` 에는 수마다 보내는 요청에 `engine_threads` 로도 실어 보내므로, 엔진이 이 값에 맞춰 탐색 스레드를 정할 수 있습니다. 연결기는 봇 관리의 동시 대국 수만큼 대국을 함께 생각합니다. 봇끼리 대국의 2판은 한 대국으로 세어 함께 생각하므로 봇끼리 대국 중에는 엔진이 하나 더 뜹니다. 게임당 스레드 × (동시 대국 수 + 1)이 CPU 스레드 수를 넘지 않게 정하세요.
 
@@ -77,11 +78,11 @@ CPU 모델명은 시작할 때 자동으로 읽습니다. Windows에서는 제�
 
 ### 엔진 레벨과 시간
 
-- **Edax 레벨:** `--edax` 에 `--nboard-depth N`(1~60)을 붙입니다. Edax 는 N 을 레벨로 쓰므로 `--nboard-depth 20` 은 L20 이고, 주지 않으면 60 입니다. Edax 는 레벨에 닿거나 이번 수의 시간이 다 되면, 먼저 오는 쪽에서 그때까지의 최선수를 둡니다.
+- **Edax 레벨:** `--edax` 에 `--nboard-depth N`(1~60)을 붙입니다. Edax 는 N 을 레벨로 쓰므로 `--nboard-depth 20` 은 L20 이고, 주지 않으면 60 입니다. Edax 는 레벨에 닿거나 이번 수의 시간이 다 되면, 먼저 오는 쪽에서 그때까지의 최선수를 둡니다. xboard 에서는 레벨을 `sd N` 으로 보냅니다.
   `python3 bot_match_client.py --edax "edax/lEdax-x86-64" --nboard-depth 20`
 - **Egaroucid 레벨:** `--egaroucid` 에 `--egaroucid-level N`(1~60)을 붙입니다. Egaroucid 를 `-level N` 으로 시작하고 남은 시간(`settime`)을 보내지 않습니다. 0 이거나 주지 않으면 대국 시계를 따르는 시간 모드입니다. 레벨 모드는 탐색을 중간에 멈출 수 없어, 한 수가 `--max-think-seconds` 를 넘으면 연결 프로그램이 엔진을 끄고 합법수 하나를 대신 둡니다. 대국 시계 안에서 넉넉히 끝나는 레벨을 고르세요.
   `python3 bot_match_client.py --egaroucid "egaroucid/bin/Egaroucid_for_Console.out" --egaroucid-level 10`
-- **시간:** `--max-think-seconds S` 는 한 수의 상한입니다(기본 10, 최대 300, 0 이면 수당 상한 없음). 대국 시계는 사이트가 정하며 연결 프로그램이 바꿀 수 없습니다. 봇끼리 대국과 자동 봇전은 판마다 색별 60초이고, 사람이 직접 신청한 대국은 신청한 사람이 고릅니다. Edax 의 한 수 시간은 S 와 (남은 시계 − 0.75초) ÷ (빈칸 수 ÷ 2) × 1.5 중 작은 쪽이라, 시간이 빠듯하면 정한 레벨보다 얕게 둘 수 있습니다.
+- **시간:** `--max-think-seconds S` 는 한 수의 상한입니다(기본 10, 최대 300, 0 이면 수당 상한 없음). 대국 시계는 사이트가 정하며 연결 프로그램이 바꿀 수 없습니다. 봇끼리 대국과 자동 봇전은 판마다 색별 60초이고, 사람이 직접 신청한 대국은 신청한 사람이 고릅니다. Edax(v1.4.8)는 S 안에서 자기 시계로 한 수의 시간을 정하고, S 에 닿으면 연결기가 그때까지의 최선수를 바로 두게 합니다. `--edax-protocol nboard` 에서는 한 수 시간이 S 와 (남은 시계 − 0.75초) ÷ (빈칸 수 ÷ 2) × 1.5 중 작은 쪽입니다.
 
 ### 직접 만든 엔진: JSON 한 줄 규격
 
