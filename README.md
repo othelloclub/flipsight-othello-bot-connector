@@ -96,7 +96,7 @@ With `--edax` or `--egaroucid`, `--engine-hash-mb MB` now sets the engine's hash
 `--engine-ponder on` with `--egaroucid` starts Egaroucid with `-ponder`: it keeps searching during the opponent's time, uses CPU then, and reports On. Edax 4.6 does not ponder in NBoard mode, so `--edax` reports Off and rejects `--engine-ponder on`. For custom engines both options still only report the setting.
 
 ```
-python3 tools/bot_match_client.py --engine-threads 2 --engine-hash-mb 256 --engine-ponder on --egaroucid "egaroucid/bin/Egaroucid_for_Console.out"
+python3 bot_match_client.py --engine-threads 2 --engine-hash-mb 256 --engine-ponder on --egaroucid "egaroucid/bin/Egaroucid_for_Console.out"
 ```
 
 한국어: `--edax`, `--egaroucid`에서 `--engine-hash-mb`는 그 값 이하에서 가장 큰 2의 거듭제곱 크기로 엔진 해시를 실제로 설정하고 그 크기를 보고합니다. `--engine-ponder on`은 Egaroucid를 `-ponder`로 실행합니다(상대 차례에도 CPU 사용). Edax 4.6은 NBoard 방식에서 폰더를 하지 않아 `--edax`는 꺼짐입니다.
