@@ -77,17 +77,31 @@ Add `--timing-log PATH` to append one line per move showing where the time went:
 
 ### Hash memory and pondering (v1.4.5)
 
-Hash is shown after Threads on the bot record, in MB per engine (1 MB = 1,048,576 bytes), not total process RAM. Known standard Edax 4.6 settings (including the current folder's `edax.ini`) and the Egaroucid Console adapter's `-hash 20` configuration are reported automatically. Unsupported or unknown configurations are left unreported. For a custom build or engine, optionally add `--engine-hash-mb 256` with the actual configured capacity. This reports the value; it does not change engine memory. A reported value takes precedence; without one, the owner can enter it in bot settings. Existing commands still work.
+Hash is shown after Threads on the bot record, in MB per engine (1 MB = 1,048,576 bytes), not total process RAM. Known standard Edax 4.6 settings (including the current folder's `edax.ini`) and the Egaroucid Console adapter's default `-hash 20` configuration are reported automatically; from v1.4.7 `--engine-hash-mb` also sets them (see below). Unsupported or unknown configurations are left unreported. For a custom build or engine, optionally add `--engine-hash-mb 256` with the actual configured capacity. For those engines this reports the value; it does not change engine memory. A reported value takes precedence; without one, the owner can enter it in bot settings. Existing commands still work.
 
 한국어: 해시는 엔진 1개 기준 MB이며 스레드 다음에 표시됩니다. 연결기 값이 없으면 봇 설정에서 입력할 수 있습니다. 자체 엔진은 `--engine-hash-mb 256`으로 실제 용량을 보고할 수 있고 엔진 설정 자체는 바뀌지 않습니다.
 
 日本語: ハッシュ容量はエンジン1個あたりのMBで、スレッドの次に表示します。接続プログラムの値がなければボット設定で手入力できます。自作エンジンは `--engine-hash-mb 256` で容量を報告できます。エンジンのメモリ設定自体は変更しません。
 
-Pondering is shown after Hash. Edax/Egaroucid adapters report their existing Off setting. For custom engines, `--engine-ponder on` or `--engine-ponder off` optionally reports the actual setting without changing it. If unreported, select the value in bot settings; reported values take precedence. Website values are informational and do not reconfigure the engine.
+Pondering is shown after Hash. The Edax adapter reports Off; the Egaroucid adapter reports Off unless `--engine-ponder on` is given (v1.4.7, below). For custom engines, `--engine-ponder on` or `--engine-ponder off` optionally reports the actual setting without changing it. If unreported, select the value in bot settings; reported values take precedence. Website values are informational and do not reconfigure the engine.
 
 한국어: 폰더는 해시 다음에 표시하며, 보고값이 없으면 봇 설정에서 켜짐/꺼짐을 선택합니다. `--engine-ponder on/off`는 자체 엔진의 실제 설정을 보고할 뿐 동작을 바꾸지 않습니다.
 
 日本語: 先読みはハッシュの次に表示し、未報告ならボット設定でオン/オフを選べます。`--engine-ponder on/off` は自作エンジンの実際の設定を報告するだけで、動作を変更しません。
+
+### Engine hash and pondering settings (v1.4.7)
+
+With `--edax` or `--egaroucid`, `--engine-hash-mb MB` now sets the engine's hash table to the largest power-of-two size not above MB (Edax `-h`, Egaroucid `-hash`) and reports that size, for example Edax 900 → 864 MB and Egaroucid 600 → 512 MB. Without it, Edax keeps `edax.ini` and Egaroucid uses 32 MB as before. Each engine has its own table, so a bot match playing two games at once uses twice as much.
+
+`--engine-ponder on` with `--egaroucid` starts Egaroucid with `-ponder`: it keeps searching during the opponent's time, uses CPU then, and reports On. Edax 4.6 does not ponder in NBoard mode, so `--edax` reports Off and rejects `--engine-ponder on`. For custom engines both options still only report the setting.
+
+```
+python3 tools/bot_match_client.py --engine-threads 2 --engine-hash-mb 256 --engine-ponder on --egaroucid "egaroucid/bin/Egaroucid_for_Console.out"
+```
+
+한국어: `--edax`, `--egaroucid`에서 `--engine-hash-mb`는 그 값 이하에서 가장 큰 2의 거듭제곱 크기로 엔진 해시를 실제로 설정하고 그 크기를 보고합니다. `--engine-ponder on`은 Egaroucid를 `-ponder`로 실행합니다(상대 차례에도 CPU 사용). Edax 4.6은 NBoard 방식에서 폰더를 하지 않아 `--edax`는 꺼짐입니다.
+
+日本語: `--edax` と `--egaroucid` では `--engine-hash-mb` がその値以下で最大の2の累乗の大きさにエンジンのハッシュを実際に設定し、その大きさを報告します。`--engine-ponder on` は Egaroucid を `-ponder` で起動します(相手の手番中もCPUを使用)。Edax 4.6はNBoard方式では先読みしないため `--edax` はオフです。
 
 ### Engine-reported settings (v1.4.6)
 

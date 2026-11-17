@@ -8,6 +8,9 @@ Credentials stay in FS_BOT_TOKEN. Engine modes:
   --edax PATH    Edax 4.6 executable; NBoard setup and per-turn time allocation are automatic
   --egaroucid PATH  Egaroucid for Console 7.8.2; native setboard/settime/go commands
                  --egaroucid-level N (1..60) plays a fixed level instead (no settime)
+  --engine-hash-mb MB sets the Edax/Egaroucid hash table (largest power-of-two size not above MB) and
+  --engine-ponder on starts Egaroucid with -ponder; both report the actual setting. Edax 4.6 does not ponder in
+  NBoard mode. With other engines both options only report the setting.
 The connector listens to the event stream (/flipsight_api/bot-stream) and reacts to opponent moves
 immediately. Events that carry this bot's own view (view "agent") update the last poll result in place, so the
 engine starts and its move is sent without another poll. agent_poll stays as the safety net: while the stream is up
@@ -37,7 +40,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = '1.4.6'
+VERSION = '1.4.7'
 WINDOWS = os.name == 'nt'
 DIRECTIONS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 # Temporary errors during a game: the first FAST_RETRIES tries wait 0.2-0.5s, later ones back off 2, 4, ... 30s.
@@ -848,6 +851,33 @@ def merge_engine_environment(environment, reported):
         environment['ponder'] = reported['ponder']
 
 
+# Edax 4.6 (64-bit) bounds its table to 2**10..2**30 entries; each main entry plus the two 1/16-size
+# side tables is 27 bytes. Egaroucid Console -hash N (0..29) allocates 2**N entries of 32 bytes.
+EDAX_HASH_BITS = (10, 30)
+EGAROUCID_HASH_LEVELS = (0, 29)
+
+
+def adapter_hash_setting(args, parser):
+    """--engine-hash-mb with --edax/--egaroucid sets the engine table to the largest power-of-two
+    size not above MB. Returns (engine arguments, actual MB), or (None, None) when it does not apply."""
+    mb = args.engine_hash_mb
+    if mb is None or not (args.edax or args.egaroucid):
+        return None, None
+    if args.edax:
+        low, high = EDAX_HASH_BITS
+        bits = int(math.floor(math.log2(mb / 27))) + 20 if mb > 0 else low - 1
+        if bits < low:
+            parser.error('--engine-hash-mb is below the smallest Edax table (%.3f MB)' % (27 * 2.0 ** (low - 20)))
+        bits = min(bits, high)
+        return ['-h', str(bits)], 27 * 2.0 ** (bits - 20)
+    low, high = EGAROUCID_HASH_LEVELS
+    level = int(math.floor(math.log2(mb))) + 15 if mb > 0 else low - 1
+    if level < low:
+        parser.error('--engine-hash-mb is below the smallest Egaroucid table (%.5f MB)' % (2.0 ** (low - 15)))
+    level = min(level, high)
+    return ['-hash', str(level)], 2.0 ** (level - 15)
+
+
 def configured_hash_mb(args):
     """Configured hash-table capacity, not process RAM. Unknown engines remain unreported.
 
@@ -889,11 +919,14 @@ def configured_hash_mb(args):
 
 
 def configured_ponder(args):
-    """The Edax adapter explicitly disables pondering; Console Egaroucid defaults to off.
+    """Egaroucid Console ponders with -ponder (--engine-ponder on). Edax 4.6 never ponders in NBoard
+    mode (its NBoard loop does not start a ponder search), so the Edax adapter reports off.
     Custom engines can optionally report their own setting without changing it.
     """
-    if args.edax or args.egaroucid:
+    if args.edax:
         return False
+    if args.egaroucid:
+        return args.engine_ponder == 'on'
     return None if args.engine_ponder is None else args.engine_ponder == 'on'
 
 
@@ -914,8 +947,8 @@ def main():
     parser.add_argument('--nboard-depth', type=int, default=0, help='Send "set depth N" to the NBoard engine (0 = engine default)')
     parser.add_argument('--engine-name', help='Reported engine name, without commands or paths')
     parser.add_argument('--engine-threads', type=int, metavar='N', help='Actual engine threads per game, shown on the bot record. Required for unattended --engine/--nboard; prompted on a terminal if omitted. With --edax/--egaroucid it is also passed to the engine (default 4 when the computer has more than 4 logical CPUs, otherwise 1)')
-    parser.add_argument('--engine-hash-mb', type=float, metavar='MB', help='Actual configured hash-table capacity per engine in MB (0..1048576); report only, does not configure engine memory. Optional for custom engines; Edax 4.6 and Egaroucid Console settings are reported automatically when known')
-    parser.add_argument('--engine-ponder', choices=('on', 'off'), help='Report the custom engine pondering setting without changing it; optional. Edax/Egaroucid adapters keep pondering off')
+    parser.add_argument('--engine-hash-mb', type=float, metavar='MB', help='Hash-table capacity per engine in MB. With --edax/--egaroucid it sets the table to the largest power-of-two size not above MB (Edax -h, Egaroucid -hash) and reports that size; without it Edax keeps edax.ini and Egaroucid uses 32 MB. For other engines it is report only (0..1048576)')
+    parser.add_argument('--engine-ponder', choices=('on', 'off'), help='With --egaroucid, on starts Egaroucid with -ponder (it keeps searching during the opponent\'s time). Edax 4.6 cannot ponder in NBoard mode. For other engines it only reports the setting')
     parser.add_argument('--cpu-name', help='Optional reported CPU model')
     parser.add_argument('--max-think-seconds', type=float, default=10, help='Optional per-turn cap; default 10s, 0 uses the remaining game clock')
     parser.add_argument('--once-match', type=int, help='Only process this match; exit when finished, aborted, expired or rejected')
@@ -938,8 +971,8 @@ def main():
         parser.error('--engine-threads must be 1..1024')
     if args.engine_hash_mb is not None and (not math.isfinite(args.engine_hash_mb) or not 0 <= args.engine_hash_mb <= 1048576):
         parser.error('--engine-hash-mb must be finite and 0..1048576')
-    if args.engine_ponder == 'on' and (args.edax or args.egaroucid):
-        parser.error('--engine-ponder on is for custom engines; the Edax/Egaroucid adapters keep pondering off')
+    if args.engine_ponder == 'on' and args.edax:
+        parser.error('--engine-ponder on is not available with --edax: Edax 4.6 does not ponder in NBoard mode')
     engine_name = args.engine_name or ('Edax' if args.edax else 'Egaroucid' if args.egaroucid else None)
     # Resolve before creating engines or contacting the site; all modes must report a known allocation.
     threads = resolve_engine_threads(args, parser)
@@ -947,7 +980,9 @@ def main():
     environment = {'cpu': detect_cpu(args.cpu_name), 'engine': engine_name, 'os': platform.system(), 'example_engine': False}
     if threads:
         environment['engine_threads'] = threads
-    hash_mb = configured_hash_mb(args)
+    hash_args, hash_mb = adapter_hash_setting(args, parser)
+    if hash_mb is None:
+        hash_mb = configured_hash_mb(args)
     if hash_mb is not None:
         environment['hash_mb'] = hash_mb
     ponder = configured_ponder(args)
@@ -961,9 +996,11 @@ def main():
             evaluation = next((os.path.abspath(os.path.expanduser(p)) for p in candidates if os.path.isfile(os.path.expanduser(p))), None)
             if not evaluation:
                 raise ValueError('Edax eval.dat not found; specify --edax-eval PATH')
-            command = [executable, '-nboard', '-eval-file', evaluation, '-n-tasks', str(threads), '-ponder', 'off']
+            command = [executable, '-nboard', '-eval-file', evaluation, '-n-tasks', str(threads), '-ponder', 'off'] + (hash_args or [])
         elif args.egaroucid:
-            command = [native_executable(args.egaroucid), '-quiet', '-noboard', '-thread', str(threads), '-hash', '20']
+            command = [native_executable(args.egaroucid), '-quiet', '-noboard', '-thread', str(threads)] + (hash_args or ['-hash', '20'])
+            if args.engine_ponder == 'on':
+                command.append('-ponder')
             if args.egaroucid_level:
                 command += ['-level', str(args.egaroucid_level)]
         else:
