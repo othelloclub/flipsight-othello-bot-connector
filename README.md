@@ -89,6 +89,10 @@ Pondering is shown after Hash. Edax/Egaroucid adapters report their existing Off
 
 日本語: 先読みはハッシュの次に表示し、未報告ならボット設定でオン/オフを選べます。`--engine-ponder on/off` は自作エンジンの実際の設定を報告するだけで、動作を変更しません。
 
+### Engine-reported settings (v1.4.6)
+
+A JSON engine can include `"environment":{"engine_threads":1,"hash_mb":32,"ponder":true}` in a normal move reply. The connector validates only these allocation fields and forwards them in the existing safety poll, using a locked snapshot. This supports FlipMind's Python adapters without another API or engine query. Legacy engines that return only `move` are unchanged. Restart an older connector and adapter to use response metadata.
+
 ### Engine level and time
 
 - **Edax level:** add `--nboard-depth N` (1 to 60) to `--edax`. Edax uses N as its level, so `--nboard-depth 20` is L20; without it the level is 60. Edax plays its best move so far when it reaches the level or the time for the move runs out, whichever comes first.

@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = '1.4.5'
+VERSION = '1.4.6'
 WINDOWS = os.name == 'nt'
 DIRECTIONS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 # Temporary errors during a game: the first FAST_RETRIES tries wait 0.2-0.5s, later ones back off 2, 4, ... 30s.
@@ -377,8 +377,9 @@ def engine_env():
 
 class PersistentJsonEngine:
     """--engine JSON-lines protocol. Each game (room/leg) owns its process and search memory."""
-    def __init__(self, command):
+    def __init__(self, command, report_environment=None):
         self.command = command
+        self.report_environment = report_environment
         self.process = None
         self.lines = None
         self.lock = threading.Lock()
@@ -432,6 +433,8 @@ class PersistentJsonEngine:
                     move = square_index(move, request.get('board_size', 8))
                 if type(move) is not int or not -1 <= move < request.get('board_size', 8)**2:
                     raise ValueError('engine move must be an index or coordinate within the board')
+                if self.report_environment:
+                    self.report_environment(answer.get('environment'))
                 # Only bounded numeric diagnostics, never arbitrary engine text or credentials.
                 timing = {key: answer[key] for key in ('used_ms', 'soft_ms', 'normal_ms', 'hard_ms', 'over_ms', 'stop_reason')
                           if type(answer.get(key)) is int}
@@ -831,6 +834,20 @@ def resolve_engine_threads(args, parser):
 MAX_SEARCHES = 8   # the site's highest max_games
 
 
+def merge_engine_environment(environment, reported):
+    """Only bounded allocation fields from a JSON engine; never publish arbitrary engine text."""
+    if not isinstance(reported, dict):
+        return
+    threads = reported.get('engine_threads')
+    if type(threads) is int and 1 <= threads <= 1024:
+        environment['engine_threads'] = threads
+    hash_mb = reported.get('hash_mb')
+    if type(hash_mb) in (int, float) and math.isfinite(hash_mb) and 0 <= hash_mb <= 1048576:
+        environment['hash_mb'] = hash_mb
+    if type(reported.get('ponder')) is bool:
+        environment['ponder'] = reported['ponder']
+
+
 def configured_hash_mb(args):
     """Configured hash-table capacity, not process RAM. Unknown engines remain unreported.
 
@@ -988,6 +1005,13 @@ def main():
         stream.start()
     engines_by_game = {}
     engine_lock = threading.Lock()
+    environment_lock = threading.Lock()
+    def report_engine_environment(reported):
+        with environment_lock:
+            merge_engine_environment(environment, reported)
+    def reported_environment():
+        with environment_lock:
+            return dict(environment)
     # Games thinking at the same time follow "Max simultaneous games" in bot management (the bot's max_games),
     # counted like the site: both boards of a bot match are one game and think together in one slot. So with
     # max games 2 a bot match plus a human game run 3 engines. Set threads x (max games + 1) to fit your CPU.
@@ -1034,7 +1058,7 @@ def main():
         factory = (lambda: EdaxEngine(command, args.nboard_depth)) if args.edax else (
             (lambda: EgaroucidEngine(command, args.egaroucid_level)) if args.egaroucid else (
             (lambda: NBoardEngine(command, args.nboard_depth)) if args.nboard else (
-            (lambda: PersistentJsonEngine(command)))))
+            (lambda: PersistentJsonEngine(command, report_engine_environment)))))
         key = (request['match_id'], request['leg'], request.get('round_no'), request.get('room_created_at'))
         with engine_lock:
             if key not in engines_by_game:
@@ -1104,7 +1128,7 @@ def main():
                 if poll_due and (base is None or time.monotonic() >= poll_not_before):
                     poll_now = True   # stays set if the poll fails, so the next round polls again
                     try:
-                        polled_base = api.call('agent_poll', environment=environment, history='brief')
+                        polled_base = api.call('agent_poll', environment=reported_environment(), history='brief')
                     except APIError as error:
                         # A finished move must not wait behind a failing poll: send it from the last known state
                         # (the server checks the revision) and poll again on its own short schedule.
