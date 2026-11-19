@@ -16,7 +16,7 @@
 - **Edax 가 자기 시계로(v1.4.8):** `--edax` 가 xboard 방식으로 연결합니다. 생각할 시간은 Edax 가 양쪽 대국 시계를 보고 정하고, 판 안에서는 기보와 해시를 이어 쓰며, `--engine-ponder on` 이면 상대 차례에도 탐색합니다. 예전 NBoard 연결은 `--edax-protocol nboard` 로 쓸 수 있습니다.
 - **멈춘 스트림도 알아챔(v1.4.9):** 이벤트 스트림이 연결된 채 15초 동안 아무것도 보내지 않으면 다시 연결하고 그동안 1초마다 조회합니다. 내가 둔 수가 1초 안에 스트림으로 돌아오지 않을 때와 내 남은 시간이 30초 아래일 때도 더 조회해서, 시간이 적을 때 상대 수를 놓쳐 잃는 시간이 10초 간격 조회보다 크게 줄어듭니다.
 
-처음 하는 사람을 위한 자세한 안내(23개 언어): [FlipSight 봇 API 문서](https://othelloclub.com/flipsight/bot/api)
+처음 하는 사람을 위한 자세한 안내(23개 언어): [FlipSight 봇 API 문서](https://othelloclub.com/flipsight/lab/api)
 
 ## FlipSight 의 봇 대국
 
@@ -29,7 +29,7 @@
 
 ## 시작하기
 
-1. FlipSight 에 로그인해 [봇 페이지](https://othelloclub.com/flipsight/bot)를 열고 **내 봇 등록**을 누릅니다.
+1. FlipSight 에 로그인해 [봇 페이지](https://othelloclub.com/flipsight/lab)를 열고 **내 봇 등록**을 누릅니다.
 2. **연결 토큰**을 복사해 둡니다. 한 번만 보이는 봇 전용 비밀번호입니다.
 3. 이 저장소를 내려받고(Code → Download ZIP, 또는 최신 릴리스) 그 폴더에서 터미널을 엽니다.
 4. 토큰을 환경 변수 `FS_BOT_TOKEN` 에 넣습니다.
@@ -101,7 +101,7 @@ CPU 모델명은 시작할 때 자동으로 읽습니다. Windows에서는 제�
 ```
 `move` 는 칸 번호(8x8 에서 `d3` = 19)나 `"d3"` 같은 좌표입니다. 둘 수 있는 수가 없으면 `-1` 을 보내 패스합니다. 표준 출력에는 이 한 줄 말고 다른 것을 쓰지 마세요.
 
-전체 항목 설명, 어떤 언어로 만든 엔진에도 쓸 수 있는 어댑터 예시, 자주 막히는 곳의 해결 방법은 [봇 API 문서](https://othelloclub.com/flipsight/bot/api)에 있습니다.
+전체 항목 설명, 어떤 언어로 만든 엔진에도 쓸 수 있는 어댑터 예시, 자주 막히는 곳의 해결 방법은 [봇 API 문서](https://othelloclub.com/flipsight/lab/api)에 있습니다.
 
 ## 공정한 플레이
 

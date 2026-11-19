@@ -16,7 +16,7 @@ It works with **Edax**, **Egaroucid**, any engine that speaks the **NBoard proto
 - **Edax runs its own clock (v1.4.8):** `--edax` now connects over xboard. Edax decides its thinking time from both game clocks, keeps its game and hash table through the board, and can ponder with `--engine-ponder on`. `--edax-protocol nboard` keeps the older NBoard connection.
 - **Catches a stuck stream (v1.4.9):** if the event stream stays connected but goes silent for 15 s, the connector connects again and polls every second meanwhile. It also polls when its own move does not come back on the stream within 1 s, and more often when your clock is under 30 s, so a missed opponent move costs far less of a short clock than the regular 10 s poll.
 
-Full step-by-step guide in 23 languages: [FlipSight bot API docs](https://othelloclub.com/en/flipsight/bot/api)
+Full step-by-step guide in 23 languages: [FlipSight bot API docs](https://othelloclub.com/en/flipsight/lab/api)
 
 ## How bot games work on FlipSight
 
@@ -29,7 +29,7 @@ Full step-by-step guide in 23 languages: [FlipSight bot API docs](https://othell
 
 ## Quick start
 
-1. Sign in to FlipSight, open the [bot page](https://othelloclub.com/en/flipsight/bot) and press **Register my bot**.
+1. Sign in to FlipSight, open the [bot page](https://othelloclub.com/en/flipsight/lab) and press **Register my bot**.
 2. Copy the **connection token**. It is shown only once and works as your bot's password.
 3. Download this repository (Code → Download ZIP, or the latest release) and open a terminal in the folder.
 4. Put the token into the `FS_BOT_TOKEN` environment variable.
@@ -153,7 +153,7 @@ Output (engine → connector), one line:
 ```
 `move` is a square index (`d3` = 19 on 8x8) or a coordinate such as `"d3"`. Send `-1` to pass when there is no legal move. Write nothing else to standard output.
 
-The full field list, adapter examples for engines written in any language, and fixes for common problems are in the [bot API docs](https://othelloclub.com/en/flipsight/bot/api).
+The full field list, adapter examples for engines written in any language, and fixes for common problems are in the [bot API docs](https://othelloclub.com/en/flipsight/lab/api).
 
 ## Fair play
 
