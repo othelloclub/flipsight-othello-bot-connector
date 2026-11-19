@@ -14,6 +14,7 @@ It works with **Edax**, **Egaroucid**, any engine that speaks the **NBoard proto
 - **Fast and light (v1.4.0):** bot games now work like human games. The server pushes the opponent's move and your bot replies at once; asking the server is only a safety net. One HTTPS connection is kept, and the connector keeps running through server restarts. In our test the network time per move dropped from 286 ms to 51 ms.
 - **Moves get through (v1.4.4):** if the server answers a move with a temporary error (too many requests, 5xx, timeout or a dropped connection), the connector sends the same move again after 0.2 to 0.5 s while the game clock allows, and the log line shows the cause.
 - **Edax runs its own clock (v1.4.8):** `--edax` now connects over xboard. Edax decides its thinking time from both game clocks, keeps its game and hash table through the board, and can ponder with `--engine-ponder on`. `--edax-protocol nboard` keeps the older NBoard connection.
+- **Catches a stuck stream (v1.4.9):** if the event stream stays connected but goes silent for 15 s, the connector connects again and polls every second meanwhile. It also polls when its own move does not come back on the stream within 1 s, and more often when your clock is under 30 s, so a missed opponent move costs far less of a short clock than the regular 10 s poll.
 
 Full step-by-step guide in 23 languages: [FlipSight bot API docs](https://othelloclub.com/en/flipsight/bot/api)
 
@@ -119,6 +120,14 @@ python3 bot_match_client.py --engine-threads 2 --engine-ponder on --edax "edax/l
 한국어: v1.4.8부터 `--edax`는 Edax를 xboard 방식으로 실행합니다. 매 수 전에 양쪽 남은 시간을 보내고 생각할 시간은 Edax가 정하며, 판 안에서는 기보와 해시를 이어 씁니다. `--engine-ponder on`이면 상대 차례에도 탐색합니다. 예전 연결은 `--edax-protocol nboard`입니다.
 
 日本語: v1.4.8から `--edax` は Edax を xboard 方式で起動します。毎手の前に双方の残り時間を送り、考える時間は Edax が決め、局の途中は棋譜とハッシュを引き継ぎます。`--engine-ponder on` なら相手の手番中も探索します。従来の接続は `--edax-protocol nboard` です。
+
+### Stream watch and safety polls (v1.4.9)
+
+The server pings the event stream every 10 s. If the stream stays connected but no line (event or ping) arrives for 15 s, the connector closes it, connects again and polls every second until it is back. While the stream is up it adds two safety polls: once when its own move has not come back on the stream within 1 s, and, on a board waiting for the opponent with less than 30 s on your clock (counting the time since the last state as used), every quarter of the remaining time (1 to 10 s, at most 60 times per match). With a healthy stream nothing changes: moves still come from the stream and the regular safety poll stays at 10 s. Stream drops, reconnects, silences, events more than 2 s late and turns skipped for lack of time each get one log line with the local time. No new options; older connectors keep working.
+
+한국어: v1.4.9부터 스트림이 연결된 채 15초 동안 아무것도 오지 않으면 다시 연결하고 그동안 1초마다 조회합니다. 내가 둔 수가 1초 안에 스트림으로 돌아오지 않을 때, 그리고 상대 차례인 판에서 내 남은 시간이 30초 아래일 때(남은 시간의 4분의 1, 1~10초, 대국마다 60번까지) 더 조회합니다. 끊김과 재연결, 멈춤, 늦은 이벤트는 시각과 함께 로그에 남습니다.
+
+日本語: v1.4.9から、ストリームがつながったまま15秒間何も届かなければ接続し直し、その間は1秒ごとに問い合わせます。自分の着手が1秒以内にストリームで返ってこないとき、また相手の手番の盤で自分の残り時間が30秒を切ったとき(残り時間の4分の1、1〜10秒、1対局60回まで)にも問い合わせます。切断、再接続、無通信、遅れたイベントは時刻付きでログに残ります。
 
 ### Engine level and time
 
