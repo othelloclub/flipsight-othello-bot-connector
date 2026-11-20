@@ -28,6 +28,11 @@ again (v1.4.9). The server itself re-sends updates that got lost on the way to t
 is gone. Stream drops, reconnects, silences, late events and turns skipped for lack of time are logged on stderr.
 A move that hits a temporary error (HTTP 429 or 5xx, timeout, connection error) is sent again within 0.2-0.5s while
 the game clock allows, honouring Retry-After; it is dropped only when the server state has moved on.
+v1.5.1: a move POST waits at most a third of that leg's clock (1.5-8s), and after a timeout both the HTTPS connection
+and the stream are opened again (a changed network path leaves the old ones dead). A move refused with HTTP 409 (the
+server moved on, often because the first try arrived) is dropped on its own while the other boards go on, and the
+stream is reconnected only if that match has no news within 1s. Reconnects asked for are merged: none while one is
+under way or within 3s of the last one.
 """
 import argparse
 import email.utils
@@ -52,7 +57,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = '1.5.0'
+VERSION = '1.5.1'
 WINDOWS = os.name == 'nt'
 DIRECTIONS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 # Temporary errors during a game: the first FAST_RETRIES tries wait 0.2-0.5s, later ones back off 2, 4, ... 30s.
@@ -77,6 +82,16 @@ ECHO_WAIT_STREAM_SEC = 2.0
 # timeout within about a second and sends it) is an update surely lost; then reconnect once per match.
 OPP_CLOCK_GRACE_SEC = 5.0
 OPP_CLOCK_RESYNCS_PER_MATCH = 1
+# v1.5.1 (2026-11-20, bot 32 lost matches 74915 and 74928 when its network path changed for a few seconds):
+#  - a move refused with HTTP 409 (the server moved on, often because the first try of the same move did arrive) is
+#    dropped on its own: the round goes on with the other boards, the error backoff is not raised, and the stream is
+#    reconnected only if no news of that match came within CONFLICT_NEWS_SEC;
+#  - reconnects asked for are merged: none while one is under way or within RESYNC_MERGE_SEC of the last one;
+#  - a move POST waits at most a third of that leg's clock (MOVE_POST_TIMEOUT_MIN..MAX); after a timeout the HTTPS
+#    connection is new (API.post closes it) and the stream is reconnected too, as both ran on the dead path.
+CONFLICT_NEWS_SEC = 1.0
+RESYNC_MERGE_SEC = 3.0
+MOVE_POST_TIMEOUT_MIN, MOVE_POST_TIMEOUT_MAX = 1.5, 8.0
 ENV_REPORT_EVERY_SEC = 30
 SAFETY_POLL_GAME_SEC = 60   # v1.5.0 (bot API v2): 60s; the waiting-leg polls still cover a quiet board after 10s
 SAFETY_POLL_IDLE_SEC = 60
@@ -206,12 +221,16 @@ class API:
                 pass
             self.connection = None
 
-    def post(self, body, headers):
-        """One POST on the kept connection. Returns (status, body, response headers)."""
+    def post(self, body, headers, timeout=8.0):
+        """One POST on the kept connection, waiting at most timeout seconds for each read (v1.5.1: per call).
+        Returns (status, body, response headers)."""
         for attempt in (0, 1):
             reused = self.connection is not None
             if not reused:
-                self.connection = http.client.HTTPSConnection(self.host, self.port, timeout=8, context=self.context)
+                self.connection = http.client.HTTPSConnection(self.host, self.port, timeout=timeout, context=self.context)
+            self.connection.timeout = timeout
+            if self.connection.sock is not None:
+                self.connection.sock.settimeout(timeout)
             try:
                 self.connection.request('POST', self.path, body=body, headers=headers)
                 response = self.connection.getresponse()
@@ -231,14 +250,14 @@ class API:
                 raise
         raise RuntimeError('unreachable')
 
-    def call(self, action, **fields):
+    def call(self, action, timeout=8.0, **fields):
         body = json.dumps(dict(action=action, **fields)).encode()
         headers = {'Authorization': 'Bearer ' + self.token, 'Content-Type': 'application/json', 'Accept': 'application/json',
                    'User-Agent': 'Python-urllib/%d.%d' % sys.version_info[:2]}
         if self.keep_alive:
             try:
                 with self.lock:
-                    status, body, response_headers = self.post(body, headers)
+                    status, body, response_headers = self.post(body, headers, timeout)
             except (OSError, http.client.HTTPException) as error:
                 raise network_error(error) from None
             # Never log response bodies: a proxy could echo the authorization header.
@@ -251,7 +270,7 @@ class API:
         else:
             request = urllib.request.Request(self.url, data=body, headers=headers, method='POST')
             try:
-                with self.opener.open(request, timeout=8) as response:
+                with self.opener.open(request, timeout=timeout) as response:
                     body = response.read(1024 * 1024 + 1)
             except urllib.error.HTTPError as error:
                 # Never log response bodies: a proxy could echo the authorization header.
@@ -1635,6 +1654,9 @@ def main():
     # v1.5.0: with the stream there is no agent_poll at all. Reconnects asked for (times, for the budget), low-clock
     # resyncs per match, the environment last reported with agent_environment and when to look again.
     resync_times, opp_resyncs, env_sent, env_next = [], {}, None, 0.0
+    # v1.5.1: match id -> local time a move of it was refused with 409; reasons to reconnect raised outside the check
+    # below (a move POST that timed out); local time of the last reconnect asked for (merging, RESYNC_MERGE_SEC).
+    conflicts, resync_asks, last_resync = {}, [], -1e9
     if stream is not None:
         planner.echo_wait = ECHO_WAIT_STREAM_SEC
     seen = {}   # --timing-log: match id -> (how the latest state arrived: event or poll, local time)
@@ -1765,6 +1787,14 @@ def main():
                         poll_now = False
                     if overdue and stream_ok:
                         reasons.append('no echo of the move')
+                    for match_id, at in list(conflicts.items()):
+                        if planner.state_at.get(match_id, -1e9) > at:
+                            del conflicts[match_id]   # the stream brought that match after the refused move
+                        elif now - at >= CONFLICT_NEWS_SEC:
+                            del conflicts[match_id]
+                            reasons.append('no news of match %s %.0fs after a refused move' % (match_id, CONFLICT_NEWS_SEC))
+                    reasons.extend(resync_asks)
+                    del resync_asks[:]
                     if base is not None and stream_ok:
                         for match_id, _leg, opp_ms in waiting_clocks(base, (base.get('bot') or {}).get('id'), opponent=True):
                             count, asked = opp_resyncs.get(match_id, (0, 0.0))
@@ -1778,10 +1808,15 @@ def main():
                             del opp_resyncs[match_id]
                     if reasons:
                         resync_times[:] = [t for t in resync_times if now - t < RESYNC_WINDOW_SEC]
-                        if len(resync_times) < RESYNC_BUDGET and stream.healthy:
+                        if stream.resync is not None or not stream.healthy:
+                            pass   # v1.5.1: a reconnect is under way; its state answers these reasons too
+                        elif now - last_resync < RESYNC_MERGE_SEC:
+                            poll_now = True   # v1.5.1: merged into the reconnect just made; asked again after the window
+                        elif len(resync_times) < RESYNC_BUDGET:
                             resync_times.append(now)
+                            last_resync = now
                             stream.request_resync(', '.join(reasons))
-                        elif len(resync_times) >= RESYNC_BUDGET:
+                        else:
                             log('Resync skipped (%s): %d reconnects in the last %d minutes already.'
                                 % (', '.join(reasons), RESYNC_BUDGET, RESYNC_WINDOW_SEC // 60))
                     if base is None:
@@ -1881,12 +1916,31 @@ def main():
                     # Human matches (negative id) also need the room's round and creation time.
                     extra = {'round_no': key[3], 'room_created_at': key[4]} if key[0] < 0 else {}
                     stamp(key, 'post')
+                    # v1.5.1: wait at most a third of this leg's clock for the answer (1.5-8s), so a dead network path
+                    # does not hold the other board for 8s.
+                    left = clock_end.get(key, time.monotonic() + 24) - time.monotonic()
+                    post_timeout = min(MOVE_POST_TIMEOUT_MAX, max(MOVE_POST_TIMEOUT_MIN, left / 3))
                     try:
-                        api.call('agent_move', match_id=key[0], leg=key[1], revision=key[2], move=move, **extra)
+                        api.call('agent_move', timeout=post_timeout, match_id=key[0], leg=key[1], revision=key[2], move=move, **extra)
                     except Exception as error:
                         undelivered.add(key)
+                        if isinstance(error, APIError) and error.status == 409:
+                            # v1.5.1: the server moved on (often the first try of this move did arrive): drop this
+                            # move only and go on with the other boards; reconnect if the stream says nothing soon.
+                            print('Move for match %s leg %s revision %s refused (HTTP 409, the server moved on); dropping it.'
+                                  % key[:3], file=sys.stderr)
+                            submitted.add(key)
+                            del jobs[key]
+                            timings.pop(key, None)
+                            move_retry.pop(key, None)
+                            clock_end.pop(key, None)
+                            undelivered.discard(key)
+                            conflicts[key[0]] = time.monotonic()
+                            continue
                         if not (isinstance(error, APIError) and error.transient):
-                            raise   # for example 409: the next poll shows whether the state moved on
+                            raise
+                        if error.status is None and stream is not None and 'timed out' in str(error):
+                            resync_asks.append('a move POST timed out')   # v1.5.1: the stream likely ran on the same path
                         # A temporary error (429, 5xx, timeout, connection): send the same move again almost at once,
                         # without waiting for a poll. The game and revision are unchanged as far as we know.
                         tries = (retry or {}).get('tries', 0) + 1
@@ -1954,6 +2008,9 @@ def main():
                             extra.append(max(at, now + 0.2))
                     if reported_environment() != env_sent:
                         extra.append(env_next)
+                    extra.extend(at + CONFLICT_NEWS_SEC for at in conflicts.values())   # v1.5.1
+                    if resync_asks or poll_now:
+                        extra.append(max(now + 0.2, last_resync + RESYNC_MERGE_SEC))
                     for at in extra:
                         if at is not None:
                             delay = min(delay, at - now)
