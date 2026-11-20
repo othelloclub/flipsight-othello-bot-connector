@@ -20,9 +20,10 @@ hello the server sends this bot's state (type "state": the bot and its ongoing g
 this bot's own view (view "agent"), so the engine starts and its move is sent at once. The environment goes with
 agent_environment at start and when the engine reports new values. When an update looks missed the connector
 reconnects the stream (every connection sends the full state again): its own move not echoed within 2s, the state
-missing or an event without a view, a board waiting on the opponent with no news for 10s on a 1-minute clock (sooner
-under 30s left, longer clocks once they could be under a minute; 3 times per match), at most 5 voluntary reconnects
-in 10 minutes. A stream that stays connected but sends nothing (not even the 10s ping) for 15s is closed and opened
+missing or an event without a view, and a board waiting on the opponent with no news of that match for the opponent's
+whole clock plus 5s (once per match; a quiet board while the opponent thinks is normal: the 1.5.0 published at 11:33
+UTC+9 on 2026-11-20 reconnected after 2-4s of quiet near the end of a game, fixed the same day), at most 5
+voluntary reconnects in 10 minutes. A stream that stays connected but sends nothing (not even the 10s ping) for 15s is closed and opened
 again (v1.4.9). The server itself re-sends updates that got lost on the way to the stream. --no-stream (polling only)
 is gone. Stream drops, reconnects, silences, late events and turns skipped for lack of time are logged on stderr.
 A move that hits a temporary error (HTTP 429 or 5xx, timeout, connection error) is sent again within 0.2-0.5s while
@@ -70,7 +71,12 @@ EVENT_LATE_MS = 2000             # a stream line this much later than the server
 RESYNC_BUDGET = 5
 RESYNC_WINDOW_SEC = 600
 ECHO_WAIT_STREAM_SEC = 2.0
-QUIET_RESYNCS_PER_MATCH = 3   # reconnects for a quiet board while waiting on the opponent (see quiet_resync_after)
+# v1.5.0 (fixed 2026-11-20 UTC+9): a board waiting on the opponent is quiet while the opponent thinks; that alone is no
+# reason to reconnect (the 11:33 build reconnected after 2-4s of quiet near the end of a 1-minute game, up to 3 times per match). Only once the
+# opponent's whole clock has run out plus OPP_CLOCK_GRACE_SEC without any news of that match (the server settles a
+# timeout within about a second and sends it) is an update surely lost; then reconnect once per match.
+OPP_CLOCK_GRACE_SEC = 5.0
+OPP_CLOCK_RESYNCS_PER_MATCH = 1
 ENV_REPORT_EVERY_SEC = 30
 SAFETY_POLL_GAME_SEC = 60   # v1.5.0 (bot API v2): 60s; the waiting-leg polls still cover a quiet board after 10s
 SAFETY_POLL_IDLE_SEC = 60
@@ -483,13 +489,11 @@ def low_clock_due_after(clock_ms):
     return high
 
 
-def quiet_resync_after(clock_ms):
-    """v1.5.0: seconds of quiet after the last state of a match at which a leg waiting on the opponent asks for a resync
-    (a stream reconnect), for this bot's clock there at that state. Under about a minute the v1.5.0 waiting-leg poll times
-    (low_clock_due_after: 10s for the bot-match clocks, sooner under LOW_CLOCK_SEC); longer clocks once the clock could
-    be under a minute. The server re-sends a lost update within a few seconds; this is the check behind that."""
-    clock = max(0, clock_ms) / 1000
-    return clock - 60 if clock >= 70 else low_clock_due_after(clock_ms)
+def opponent_clock_resync_after(opp_clock_ms):
+    """v1.5.0: seconds of quiet after the last state of a match at which a leg waiting on the opponent asks for a resync:
+    the opponent's clock at that state (its time when its turn began, so this is late rather than early) plus
+    OPP_CLOCK_GRACE_SEC. By then the opponent has moved or lost on time, and either is sent on the stream."""
+    return max(0, opp_clock_ms) / 1000 + OPP_CLOCK_GRACE_SEC
 
 
 def low_clock_counted(clock_ms):
@@ -498,9 +502,10 @@ def low_clock_counted(clock_ms):
     return clock_ms < (LOW_CLOCK_SEC + 10) * 1000
 
 
-def waiting_clocks(payload, my_id):
-    """(match id, leg, this bot's clock in ms) for every active leg of a running game where the opponent is to move.
-    Never raises: the regular checks in current_turns() report bad states."""
+def waiting_clocks(payload, my_id, opponent=False):
+    """(match id, leg, this bot's clock in ms) for every active leg of a running game where the opponent is to move
+    (with opponent=True the opponent's clock instead, v1.5.0). Never raises: the regular checks in current_turns()
+    report bad states."""
     result = []
     if not isinstance(payload, dict):
         return result
@@ -517,8 +522,9 @@ def waiting_clocks(payload, my_id):
             if not isinstance(leg, dict) or leg.get('status') not in ('running', 'playing', 'active') or leg.get('turn') != 3 - color:
                 continue
             clocks = leg.get('clocks_ms')
-            if isinstance(clocks, list) and len(clocks) == 2 and type(clocks[color - 1]) in (int, float):
-                result.append((match['id'], leg_index, int(clocks[color - 1])))
+            side = 2 - color if opponent else color - 1
+            if isinstance(clocks, list) and len(clocks) == 2 and type(clocks[side]) in (int, float):
+                result.append((match['id'], leg_index, int(clocks[side])))
     return result
 
 
@@ -1628,7 +1634,7 @@ def main():
     hello_at, state_due = None, None
     # v1.5.0: with the stream there is no agent_poll at all. Reconnects asked for (times, for the budget), low-clock
     # resyncs per match, the environment last reported with agent_environment and when to look again.
-    resync_times, quiet_resyncs, env_sent, env_next = [], {}, None, 0.0
+    resync_times, opp_resyncs, env_sent, env_next = [], {}, None, 0.0
     if stream is not None:
         planner.echo_wait = ECHO_WAIT_STREAM_SEC
     seen = {}   # --timing-log: match id -> (how the latest state arrived: event or poll, local time)
@@ -1760,16 +1766,16 @@ def main():
                     if overdue and stream_ok:
                         reasons.append('no echo of the move')
                     if base is not None and stream_ok:
-                        for match_id, _leg, clock_ms in waiting_clocks(base, (base.get('bot') or {}).get('id')):
-                            count, asked = quiet_resyncs.get(match_id, (0, 0.0))
+                        for match_id, _leg, opp_ms in waiting_clocks(base, (base.get('bot') or {}).get('id'), opponent=True):
+                            count, asked = opp_resyncs.get(match_id, (0, 0.0))
                             since = max(planner.state_at.get(match_id, now), asked)
-                            if count < QUIET_RESYNCS_PER_MATCH and now - since >= quiet_resync_after(clock_ms):
-                                quiet_resyncs[match_id] = (count + 1, now)   # counted even when the budget skips it
-                                reasons.append('match %s quiet for %.0fs while waiting on the opponent' % (match_id, now - since))
+                            if count < OPP_CLOCK_RESYNCS_PER_MATCH and now - since >= opponent_clock_resync_after(opp_ms):
+                                opp_resyncs[match_id] = (count + 1, now)   # counted even when the budget skips it
+                                reasons.append("match %s: no news for %.0fs, past the opponent's clock" % (match_id, now - since))
                                 break
                         live = {m.get('id') for m in base['matches'] if isinstance(m, dict)}
-                        for match_id in [m for m in quiet_resyncs if m not in live]:
-                            del quiet_resyncs[match_id]
+                        for match_id in [m for m in opp_resyncs if m not in live]:
+                            del opp_resyncs[match_id]
                     if reasons:
                         resync_times[:] = [t for t in resync_times if now - t < RESYNC_WINDOW_SEC]
                         if len(resync_times) < RESYNC_BUDGET and stream.healthy:
@@ -1939,12 +1945,12 @@ def main():
                 if move_retry:
                     delay = min(delay, min(r['at'] for r in move_retry.values()) - now)
                 if stream is not None and stream_ok:
-                    # v1.5.0: wake for a due echo, a due quiet-board resync and to notice silence.
+                    # v1.5.0: wake for a due echo, for a board past the opponent's clock and to notice silence.
                     extra = [planner.next_echo_at()]
-                    for match_id, _leg, clock_ms in waiting_clocks(payload, my_id):
-                        count, asked = quiet_resyncs.get(match_id, (0, 0.0))
-                        if count < QUIET_RESYNCS_PER_MATCH:
-                            at = max(planner.state_at.get(match_id, now), asked) + quiet_resync_after(clock_ms)
+                    for match_id, _leg, opp_ms in waiting_clocks(payload, my_id, opponent=True):
+                        count, asked = opp_resyncs.get(match_id, (0, 0.0))
+                        if count < OPP_CLOCK_RESYNCS_PER_MATCH:
+                            at = max(planner.state_at.get(match_id, now), asked) + opponent_clock_resync_after(opp_ms)
                             extra.append(max(at, now + 0.2))
                     if reported_environment() != env_sent:
                         extra.append(env_next)
