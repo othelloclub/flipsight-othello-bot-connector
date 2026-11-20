@@ -18,14 +18,16 @@ immediately. Events that carry this bot's own view (view "agent") update the las
 engine starts and its move is sent without another poll. Since v1.4.10 the stream is opened with ?state=1: right
 after hello the server sends this bot's whole agent_poll answer (type "state"), and games against people,
 invitations and new matches also come with this bot's view, so connecting, reconnecting, accepting and human games
-need no poll. agent_poll stays as the safety net: while the stream is up every 30s during a game (10s before v1.4.10)
-and every 60s when idle, 1s/5s while the stream is down, and once at start (it reports the environment).
+need no poll. agent_poll stays as the safety net: while the stream is up every 60s (v1.5.0; 30s in v1.4.10, 10s
+before) during a game and when idle, 1s/5s while the stream is down, and once at start (it reports the environment).
+Since v1.5.0 polls ask for scope "active" (this bot and its ongoing games only, the content of the stream state), so
+a poll answer is a few KB per ongoing game instead of about 100KB (FlipSight bot API v2, 2026-11-20).
 A stream that stays connected but sends nothing (not even the 10s ping) for 15s counts as down (v1.4.9): the
 connector closes it, polls every 1s and connects again. While the stream is up it also polls once when the stream has
 not echoed this bot's own move within 1s, and, in a leg waiting on the opponent, when no state of that match arrived
 for a while, counting the time since then as used on this bot's clock: under 30s left every min(10, max(1,
-remaining/4))s (at most 60 times per match, then every 10s), otherwise every min(30, max(10, remaining/12))s
-(10s with the 1-minute clocks of bot matches). Stream drops, reconnects, silences, late events and turns skipped for
+remaining/4))s (at most 12 times per match from v1.5.0), 10s while under a minute (the 1-minute clocks of bot
+matches) and the regular poll for longer clocks. v1.5.0 stays well under the bot API v2 limit of 30 polls in 10 minutes. Stream drops, reconnects, silences, late events and turns skipped for
 lack of time are logged on stderr.
 A move that hits a temporary error (HTTP 429 or 5xx, timeout, connection error) is sent again within 0.2-0.5s while
 the game clock allows, honouring Retry-After; it is dropped only when the server state has moved on.
@@ -53,7 +55,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = '1.4.10'
+VERSION = '1.5.0'
 WINDOWS = os.name == 'nt'
 DIRECTIONS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 # Temporary errors during a game: the first FAST_RETRIES tries wait 0.2-0.5s, later ones back off 2, 4, ... 30s.
@@ -63,11 +65,11 @@ FAST_RETRIES = 4
 STREAM_SILENCE_SEC = 15
 ECHO_WAIT_SEC = 1.0              # the stream echoes this bot's own move within about 0.1s
 LOW_CLOCK_SEC = 30               # below this on this bot's clock, poll every min(10, max(1, remaining / 4))s
-LOW_CLOCK_POLLS_PER_MATCH = 60   # a poll answer is about 100KB; after this many that match is polled every 10s
+LOW_CLOCK_POLLS_PER_MATCH = 12   # v1.5.0 (60 before): after this many only the regular safety poll is left for that match
 EVENT_LATE_MS = 2000             # a stream line this much later than the server sent it is logged
 # v1.4.10: safety polls while the stream is up (the stream carries every state) and how long to wait for the state
 # the server sends after hello on a ?state=1 stream before polling instead.
-SAFETY_POLL_GAME_SEC = 30
+SAFETY_POLL_GAME_SEC = 60   # v1.5.0 (bot API v2): 60s; the waiting-leg polls still cover a quiet board after 10s
 SAFETY_POLL_IDLE_SEC = 60
 STATE_WAIT_SEC = 3.0
 
@@ -431,7 +433,9 @@ def low_clock_interval(remaining_s):
     because the regular safety poll during a game is 30s."""
     if remaining_s < LOW_CLOCK_SEC:
         return min(10.0, max(1.0, remaining_s / 4))
-    return min(30.0, max(10.0, remaining_s / 12))
+    # v1.5.0: 10s up to a minute on the clock (bot matches), then the regular safety poll. Games against people with long
+    # clocks would otherwise check every 10-30s while the person thinks, over the v2 limit of 30 polls in 10 minutes.
+    return 10.0 if remaining_s < 60 else float(SAFETY_POLL_GAME_SEC)
 
 
 def low_clock_due_after(clock_ms):
@@ -441,7 +445,7 @@ def low_clock_due_after(clock_ms):
     (x - interval only grows, so bisection finds it). Every stream event of the match is a new state, so in a running
     bot match (two legs, events every few seconds) these polls come only when the match has been quiet."""
     clock = max(0, clock_ms) / 1000
-    low, high = 0.0, 30.0
+    low, high = 0.0, float(SAFETY_POLL_GAME_SEC)
     for _ in range(30):
         middle = (low + high) / 2
         if middle >= low_clock_interval(clock - middle):
@@ -491,8 +495,9 @@ class PollPlanner:
       - waiting leg: in a leg waiting on the opponent, this bot's clock may have been running since the last state of
         that match arrived (by poll, event or stream state). Counting that time as used, poll low_clock_interval()
         after the last state: under LOW_CLOCK_SEC every min(10, max(1, remaining / 4))s, at most
-        LOW_CLOCK_POLLS_PER_MATCH times per match (then every 10s); from v1.4.10, when the regular game poll became 30s,
-        also above it, every min(30, max(10, remaining / 12))s.
+        LOW_CLOCK_POLLS_PER_MATCH times per match (12 from v1.5.0, then only the regular poll); from v1.4.10 also
+        above it: 10s while under a minute (1.4.10: min(30, max(10, remaining / 12))s), from v1.5.0 the regular 60s
+        poll for longer clocks.
     All times are local monotonic seconds."""
 
     def __init__(self):
@@ -547,7 +552,9 @@ class PollPlanner:
         that used up its low-clock polls is polled every 10s after its last state (the v1.4.9 regular poll)."""
         due = {}
         for match_id, _leg, clock_ms in waiting:
-            after = 10.0 if match_id in self.capped else low_clock_due_after(clock_ms)
+            if match_id in self.capped:
+                continue   # v1.5.0: a match that used up its low-clock polls is left to the regular safety poll
+            after = low_clock_due_after(clock_ms)
             at = self.state_at.get(match_id, fallback_at) + after
             due[match_id] = min(due.get(match_id, at), at)
         return due
@@ -1694,7 +1701,9 @@ def main():
                     poll_now = True   # stays set if the poll fails, so the next round polls again
                     poll_started = time.monotonic()
                     try:
-                        polled_base = api.call('agent_poll', environment=reported_environment(), history='brief')
+                        # v1.5.0: scope "active" returns this bot and its ongoing games only (a few KB per game), the same
+                        # content as the stream state; history "brief" stays for a server that does not know scope.
+                        polled_base = api.call('agent_poll', environment=reported_environment(), history='brief', scope='active')
                     except APIError as error:
                         # A finished move must not wait behind a failing poll: send it from the last known state
                         # (the server checks the revision) and poll again on its own short schedule.

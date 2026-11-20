@@ -15,6 +15,7 @@ It works with **Edax**, **Egaroucid**, any engine that speaks the **NBoard proto
 - **Moves get through (v1.4.4):** if the server answers a move with a temporary error (too many requests, 5xx, timeout or a dropped connection), the connector sends the same move again after 0.2 to 0.5 s while the game clock allows, and the log line shows the cause.
 - **Edax runs its own clock (v1.4.8):** `--edax` now connects over xboard. Edax decides its thinking time from both game clocks, keeps its game and hash table through the board, and can ponder with `--engine-ponder on`. `--edax-protocol nboard` keeps the older NBoard connection.
 - **Catches a stuck stream (v1.4.9):** if the event stream stays connected but goes silent for 15 s, the connector connects again and polls every second meanwhile. It also polls when its own move does not come back on the stream within 1 s, and more often when your clock is under 30 s, so a missed opponent move costs far less of a short clock than the regular 10 s poll.
+- **Bot API v2 (v1.5.0):** recovery polls ask only for your bot and ongoing games (`scope: "active"`, a few KB) about once a minute. From 2026-11-23, registered bots that do not meet bot API v2 are left out of automatic matching; v1.5.0 and v1.4.10 meet it.
 - **State from the stream (v1.4.10):** the event stream is opened with `?state=1`. The server sends the current state as soon as the stream connects or reconnects, and games against people and invitations come with your own view, so the connector no longer polls for them. The safety poll during a game is now 30 s instead of 10 s; a board waiting for the opponent is checked only after 10 s without news of that match (on a 1-minute clock; under 30 s left as in v1.4.9), and the 1 s echo check stays.
 
 Full step-by-step guide in 23 languages: [FlipSight bot API docs](https://othelloclub.com/en/flipsight/lab/api)
@@ -121,6 +122,14 @@ python3 bot_match_client.py --engine-threads 2 --engine-ponder on --edax "edax/l
 한국어: v1.4.8부터 `--edax`는 Edax를 xboard 방식으로 실행합니다. 매 수 전에 양쪽 남은 시간을 보내고 생각할 시간은 Edax가 정하며, 판 안에서는 기보와 해시를 이어 씁니다. `--engine-ponder on`이면 상대 차례에도 탐색합니다. 예전 연결은 `--edax-protocol nboard`입니다.
 
 日本語: v1.4.8から `--edax` は Edax を xboard 方式で起動します。毎手の前に双方の残り時間を送り、考える時間は Edax が決め、局の途中は棋譜とハッシュを引き継ぎます。`--engine-ponder on` なら相手の手番中も探索します。従来の接続は `--edax-protocol nboard` です。
+
+### Bot API v2 (v1.5.0)
+
+FlipSight bot API v2 (2026-11-20) works like the Lichess bot API: the state comes only from the event stream (`?state=1`: your bot and ongoing games once when you connect, then one small event per changed game), moves and accepting stay plain POSTs, and `agent_poll` is for recovery only. v1.5.0 adds `"scope": "active"` to its polls, so a poll answer has only your bot and ongoing games (a few KB instead of about 100 KB), and polls about once a minute while the stream is up (30 s in v1.4.10). A bot meets v2 when, over its last 10 minutes online, a `?state=1` stream is connected, it makes at most 30 polls while that stream is connected, and it opens at most 10 stream connections. From 2026-11-23 00:00 KST, registered bots that do not meet v2 are left out of automatic matching (direct challenges and games against people are not affected). Bot management on FlipLab shows your bot's status.
+
+한국어: v1.5.0 은 봇 API v2 에 맞춘 판입니다. 조회에 `"scope": "active"` 를 넣어 내 봇과 진행 중인 대국만 받고(수 KB), 스트림이 정상이면 1분에 한 번쯤만 조회합니다. 2026-11-23 부터 v2 에 맞지 않는 등록봇은 자동 매칭에서 빠지며 v1.5.0 과 v1.4.10 은 맞습니다.
+
+日本語: v1.5.0 はボットAPI v2 に合わせた版です。問い合わせに `"scope": "active"` を入れて自分のボットと進行中の対局だけを受け取り（数KB）、ストリームが正常なら1分に1回程度だけ問い合わせます。2026-11-23 から v2 に適合しない登録ボットは自動マッチングから外れ、v1.5.0 と v1.4.10 は適合します。
 
 ### State from the stream (v1.4.10)
 
