@@ -15,6 +15,7 @@ It works with **Edax**, **Egaroucid**, any engine that speaks the **NBoard proto
 - **Moves get through (v1.4.4):** if the server answers a move with a temporary error (too many requests, 5xx, timeout or a dropped connection), the connector sends the same move again after 0.2 to 0.5 s while the game clock allows, and the log line shows the cause.
 - **Edax runs its own clock (v1.4.8):** `--edax` now connects over xboard. Edax decides its thinking time from both game clocks, keeps its game and hash table through the board, and can ponder with `--engine-ponder on`. `--edax-protocol nboard` keeps the older NBoard connection.
 - **Catches a stuck stream (v1.4.9):** if the event stream stays connected but goes silent for 15 s, the connector connects again and polls every second meanwhile. It also polls when its own move does not come back on the stream within 1 s, and more often when your clock is under 30 s, so a missed opponent move costs far less of a short clock than the regular 10 s poll.
+- **State from the stream (v1.4.10):** the event stream is opened with `?state=1`. The server sends the current state as soon as the stream connects or reconnects, and games against people and invitations come with your own view, so the connector no longer polls for them. The safety poll during a game is now 30 s instead of 10 s; a board waiting for the opponent is checked only after 10 s without news of that match (on a 1-minute clock; under 30 s left as in v1.4.9), and the 1 s echo check stays.
 
 Full step-by-step guide in 23 languages: [FlipSight bot API docs](https://othelloclub.com/en/flipsight/lab/api)
 
@@ -120,6 +121,14 @@ python3 bot_match_client.py --engine-threads 2 --engine-ponder on --edax "edax/l
 한국어: v1.4.8부터 `--edax`는 Edax를 xboard 방식으로 실행합니다. 매 수 전에 양쪽 남은 시간을 보내고 생각할 시간은 Edax가 정하며, 판 안에서는 기보와 해시를 이어 씁니다. `--engine-ponder on`이면 상대 차례에도 탐색합니다. 예전 연결은 `--edax-protocol nboard`입니다.
 
 日本語: v1.4.8から `--edax` は Edax を xboard 方式で起動します。毎手の前に双方の残り時間を送り、考える時間は Edax が決め、局の途中は棋譜とハッシュを引き継ぎます。`--engine-ponder on` なら相手の手番中も探索します。従来の接続は `--edax-protocol nboard` です。
+
+### State from the stream (v1.4.10)
+
+The connector opens the event stream with `?state=1`. Right after `hello` the server sends a `state` event with the same content as an `agent_poll` answer, and every `match` event (bot matches, invitations and games against people) carries your own view of the match (`"view": "agent"`), so connecting, reconnecting, accepting and games against people need no poll. `agent_poll` is now only the safety net: once at start (it reports your environment), every 30 s during a game (was 10 s) and every 60 s while idle. On a board waiting for the opponent, the connector counts the time since the last news of that match as used on your clock and checks after 10 s on a 1-minute clock (under 30 s left, every quarter of the remaining time as in v1.4.9). The 1 s echo check and the stuck-stream detection stay. A server without `?state=1` support is handled as before. In a test against a local server, a bot match, a game against a person and one reconnect took 7 polls in 140 s instead of 40.
+
+한국어: v1.4.10부터 스트림을 `?state=1`로 엽니다. 연결 직후 서버가 `agent_poll`과 같은 상태를 보내고, 봇끼리 대국, 신청, 사람과의 대국이 모두 내 쪽 값(`"view": "agent"`)으로 와서 연결, 재연결, 수락, 사람과의 대국에 조회가 필요 없습니다. 안전 조회는 시작할 때 한 번, 대국 중 30초(예전 10초), 쉴 때 60초입니다. 상대 차례인 판은 그 대국 소식이 없던 시간을 내 시계에서 쓴 것으로 보고 1분 시계에서 10초 뒤 확인합니다(남은 30초 아래는 v1.4.9와 같음).
+
+日本語: v1.4.10からストリームを `?state=1` で開きます。接続直後にサーバーが `agent_poll` と同じ状態を送り、ボット同士の対局、申し込み、人との対局がすべて自分側の値(`"view": "agent"`)で届くため、接続、再接続、承諾、人との対局で問い合わせが要りません。安全な問い合わせは開始時に1回、対局中30秒(従来10秒)、待機中60秒です。相手の手番の盤は、その対局の知らせがない時間を自分の持ち時間から使ったものとみなし、1分の持ち時間なら10秒後に確認します(残り30秒未満はv1.4.9と同じ)。
 
 ### Stream watch and safety polls (v1.4.9)
 
