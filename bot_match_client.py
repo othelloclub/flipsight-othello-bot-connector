@@ -14,21 +14,17 @@ Credentials stay in FS_BOT_TOKEN. Engine modes:
   --engine-ponder on lets Edax (xboard) and Egaroucid (-ponder) think in the opponent's time; both report the
   actual setting. With other engines both options only report the setting.
 The connector listens to the event stream (/flipsight_api/bot-stream) and reacts to opponent moves
-immediately. Events that carry this bot's own view (view "agent") update the last poll result in place, so the
-engine starts and its move is sent without another poll. Since v1.4.10 the stream is opened with ?state=1: right
-after hello the server sends this bot's whole agent_poll answer (type "state"), and games against people,
-invitations and new matches also come with this bot's view, so connecting, reconnecting, accepting and human games
-need no poll. agent_poll stays as the safety net: while the stream is up every 60s (v1.5.0; 30s in v1.4.10, 10s
-before) during a game and when idle, 1s/5s while the stream is down, and once at start (it reports the environment).
-Since v1.5.0 polls ask for scope "active" (this bot and its ongoing games only, the content of the stream state), so
-a poll answer is a few KB per ongoing game instead of about 100KB (FlipSight bot API v2, 2026-11-20).
-A stream that stays connected but sends nothing (not even the 10s ping) for 15s counts as down (v1.4.9): the
-connector closes it, polls every 1s and connects again. While the stream is up it also polls once when the stream has
-not echoed this bot's own move within 1s, and, in a leg waiting on the opponent, when no state of that match arrived
-for a while, counting the time since then as used on this bot's clock: under 30s left every min(10, max(1,
-remaining/4))s (at most 12 times per match from v1.5.0), 10s while under a minute (the 1-minute clocks of bot
-matches) and the regular poll for longer clocks. v1.5.0 stays well under the bot API v2 limit of 30 polls in 10 minutes. Stream drops, reconnects, silences, late events and turns skipped for
-lack of time are logged on stderr.
+immediately. Since v1.5.0 (FlipSight bot API v2, shaped like the Lichess bot API: agent_poll is removed on
+2026-11-22 00:00 UTC+9) the state comes only from the stream and the connector never calls agent_poll: right after
+hello the server sends this bot's state (type "state": the bot and its ongoing games), and every match event carries
+this bot's own view (view "agent"), so the engine starts and its move is sent at once. The environment goes with
+agent_environment at start and when the engine reports new values. When an update looks missed the connector
+reconnects the stream (every connection sends the full state again): its own move not echoed within 2s, the state
+missing or an event without a view, a board waiting on the opponent with no news for 10s on a 1-minute clock (sooner
+under 30s left, longer clocks once they could be under a minute; 3 times per match), at most 5 voluntary reconnects
+in 10 minutes. A stream that stays connected but sends nothing (not even the 10s ping) for 15s is closed and opened
+again (v1.4.9). The server itself re-sends updates that got lost on the way to the stream. --no-stream (polling only)
+is gone. Stream drops, reconnects, silences, late events and turns skipped for lack of time are logged on stderr.
 A move that hits a temporary error (HTTP 429 or 5xx, timeout, connection error) is sent again within 0.2-0.5s while
 the game clock allows, honouring Retry-After; it is dropped only when the server state has moved on.
 """
@@ -69,6 +65,13 @@ LOW_CLOCK_POLLS_PER_MATCH = 12   # v1.5.0 (60 before): after this many only the 
 EVENT_LATE_MS = 2000             # a stream line this much later than the server sent it is logged
 # v1.4.10: safety polls while the stream is up (the stream carries every state) and how long to wait for the state
 # the server sends after hello on a ?state=1 stream before polling instead.
+# v1.5.0 (bot API v2, no agent_poll): with the stream, resyncing means reconnecting it. Voluntary reconnects stay within
+# RESYNC_BUDGET per RESYNC_WINDOW_SEC (the server allows 10 connections in 10 minutes); the server re-sends lost updates.
+RESYNC_BUDGET = 5
+RESYNC_WINDOW_SEC = 600
+ECHO_WAIT_STREAM_SEC = 2.0
+QUIET_RESYNCS_PER_MATCH = 3   # reconnects for a quiet board while waiting on the opponent (see quiet_resync_after)
+ENV_REPORT_EVERY_SEC = 30
 SAFETY_POLL_GAME_SEC = 60   # v1.5.0 (bot API v2): 60s; the waiting-leg polls still cover a quiet board after 10s
 SAFETY_POLL_IDLE_SEC = 60
 STATE_WAIT_SEC = 3.0
@@ -260,6 +263,10 @@ class API:
         return data
 
 
+class WaitingForState(Exception):
+    """v1.5.0: the stream has not sent the state yet (no poll to fall back on)."""
+
+
 class EventStream(threading.Thread):
     """Reads NDJSON events, hands hello and match events to the main loop (events queue) and wakes it.
 
@@ -278,6 +285,7 @@ class EventStream(threading.Thread):
         self.ping = None
         self.response = None
         self.silenced = False   # mark_silent() closed the current connection
+        self.resync = None      # v1.5.0: reason of a requested reconnect (request_resync), reconnects at once
 
     def mark_silent(self):
         """The main loop saw no line for STREAM_SILENCE_SEC on a connection that looks open: count the stream as down
@@ -291,6 +299,21 @@ class EventStream(threading.Thread):
         try:
             # http.client response -> socket file -> socket. Shutting the socket down ends the blocked read in the
             # reader thread on every platform; the socket timeout ends it too if this does not work.
+            sock = response.fp.raw._sock if response is not None else None
+            if sock is not None:
+                socket.socket.shutdown(sock, socket.SHUT_RDWR)
+        except (AttributeError, OSError, ValueError, TypeError):
+            pass
+
+    def request_resync(self, reason):
+        """v1.5.0: reconnect to get the full state again (bot API v2 has no poll). The reader reconnects after 0.2s."""
+        self.resync = reason
+        log('Reconnecting the event stream to resync (%s).' % reason)
+        self._shutdown()
+
+    def _shutdown(self):
+        response = self.response
+        try:
             sock = response.fp.raw._sock if response is not None else None
             if sock is not None:
                 socket.socket.shutdown(sock, socket.SHUT_RDWR)
@@ -358,6 +381,11 @@ class EventStream(threading.Thread):
             was_healthy, self.healthy = self.healthy, False
             if was_healthy:
                 self.wake.set()   # fall back to fast polling right away
+            if self.resync is not None:
+                self.resync = None
+                down_since = time.monotonic()
+                self.stopping.wait(0.2)   # requested reconnect: no backoff, no failure line
+                continue
             wait = backoff + random.random()
             if connected:
                 down_since = time.monotonic()
@@ -455,6 +483,15 @@ def low_clock_due_after(clock_ms):
     return high
 
 
+def quiet_resync_after(clock_ms):
+    """v1.5.0: seconds of quiet after the last state of a match at which a leg waiting on the opponent asks for a resync
+    (a stream reconnect), for this bot's clock there at that state. Under about a minute the v1.5.0 waiting-leg poll times
+    (low_clock_due_after: 10s for the bot-match clocks, sooner under LOW_CLOCK_SEC); longer clocks once the clock could
+    be under a minute. The server re-sends a lost update within a few seconds; this is the check behind that."""
+    clock = max(0, clock_ms) / 1000
+    return clock - 60 if clock >= 70 else low_clock_due_after(clock_ms)
+
+
 def low_clock_counted(clock_ms):
     """Whether a poll for this clock counts against LOW_CLOCK_POLLS_PER_MATCH (the v1.4.9 low-clock polls: the clock
     may fall under LOW_CLOCK_SEC within 10s). Polls above that are at least 10s apart and are not counted."""
@@ -506,6 +543,7 @@ class PollPlanner:
         self.low_polls = {}   # match id -> low-clock polls made
         self.capped = set()   # match ids that used up their low-clock polls
         self.human_echo = False   # the stream sends this bot's view of games against people (?state=1, v1.4.10)
+        self.echo_wait = ECHO_WAIT_SEC   # v1.5.0: ECHO_WAIT_STREAM_SEC with the stream (a resync is a reconnect)
 
     def note_poll(self, matches, started_at, answered_at):
         """A poll sent at started_at answered at answered_at with the given matches."""
@@ -535,7 +573,7 @@ class PollPlanner:
         # Games against people (negative id) are echoed only on a ?state=1 stream (human_echo, v1.4.10); before, every
         # room event already polled.
         if key[0] > 0 or self.human_echo:
-            self.echo[key] = (accepted_at, accepted_at + ECHO_WAIT_SEC)
+            self.echo[key] = (accepted_at, accepted_at + self.echo_wait)
 
     def overdue_echoes(self, now):
         """Turn keys whose echo is overdue (each one is returned once)."""
@@ -1250,12 +1288,13 @@ def thinking_budget(remaining_ms, max_think_seconds):
     return min(max_think_seconds, available) if max_think_seconds else available
 
 
-def incoming_challenge(payload, my_id, selected=None):
-    """Pending pairs already reserve capacity; accept within the configured total load."""
+def incoming_challenge(payload, my_id, selected=None, use_games_now=True):
+    """Pending pairs already reserve capacity; accept within the configured total load. v1.5.0: with the stream the
+    bot row (games_now) is only as fresh as the last connection, so the load is counted from the known matches."""
     bot = payload.get('bot') or {}
     limit = bot.get('max_games', 2)
     limit = max(1, min(8, limit if type(limit) is int else 2))
-    load = bot.get('games_now')
+    load = bot.get('games_now') if use_games_now else None
     if type(load) is not int:
         load = sum(m.get('status') in ('pending', 'running') for m in payload.get('matches', []))
     if load > limit:
@@ -1389,7 +1428,7 @@ def main():
     parser = argparse.ArgumentParser(description='FlipSight bot connector')
     parser.add_argument('--api', default='https://othelloclub.com/flipsight/bot_match_api.php')
     parser.add_argument('--stream-url', help='Event stream URL; default is /flipsight_api/bot-stream on the API host')
-    parser.add_argument('--no-stream', action='store_true', help='Do not use the event stream; poll only')
+    parser.add_argument('--no-stream', action='store_true', help=argparse.SUPPRESS)   # removed in v1.5.0 (no agent_poll)
     engines = parser.add_mutually_exclusive_group(required=True)
     engines.add_argument('--engine', help='Local command, one process per game: repeatedly read one JSON request line and write one {"move": index} line')
     engines.add_argument('--nboard', help='Local command of an engine that speaks the NBoard protocol (kept running)')
@@ -1481,11 +1520,14 @@ def main():
         parser.error('--once-match must be a non-zero ID')
     if args.max_runtime is not None and (not math.isfinite(args.max_runtime) or args.max_runtime <= 0):
         parser.error('--max-runtime must be finite and positive')
+    if args.no_stream:
+        parser.error('--no-stream was removed in v1.5.0: agent_poll is removed on 2026-11-22 00:00 (UTC+9) and the state '
+                     'comes only from the event stream')
     token = os.environ.get('FS_BOT_TOKEN', '')
     try:
         api = API(args.api, token)
         stream_url = None
-        if not args.no_stream:
+        if True:   # v1.5.0: the stream is the only source of state (no agent_poll)
             api_url = urllib.parse.urlsplit(args.api)
             stream_url = args.stream_url or '%s://%s/flipsight_api/bot-stream' % (api_url.scheme, api_url.netloc)
             # The token goes to this URL too: only the API host itself is accepted.
@@ -1577,12 +1619,18 @@ def main():
     # The last agent_poll result, kept current with view "agent" stream events, and the server clock behind it
     # (server_now_ms and the local time it was taken) so remaining clocks are computed for "now".
     base, server_clock = None, None
-    last_poll, poll_every, poll_now = None, 0.0, True
+    # v1.5.0: with the stream the state comes on connect; nothing to ask for before it (or STATE_WAIT_SEC) is due.
+    last_poll, poll_every, poll_now = None, 0.0, stream is None
     # v1.4.9: extra safety polls (PollPlanner), whether the stream counts as up (set each round), and the clock of the
     # last poll (server_now_ms, local time in the middle of it) for late-event lines.
     planner, stream_ok, poll_clock, last_ping = PollPlanner(), False, None, None
     # v1.4.10: local time of the latest hello and, after a hello that announced a state, when to stop waiting for it.
     hello_at, state_due = None, None
+    # v1.5.0: with the stream there is no agent_poll at all. Reconnects asked for (times, for the budget), low-clock
+    # resyncs per match, the environment last reported with agent_environment and when to look again.
+    resync_times, quiet_resyncs, env_sent, env_next = [], {}, None, 0.0
+    if stream is not None:
+        planner.echo_wait = ECHO_WAIT_STREAM_SEC
     seen = {}   # --timing-log: match id -> (how the latest state arrived: event or poll, local time)
     timing_file = None
     if args.timing_log:
@@ -1661,7 +1709,7 @@ def main():
                         seen[match['id']] = ('event', received)
                         if any(m is match for m in base['matches']):
                             planner.note_event(match, received)
-                        if match.get('status') == 'pending' and str(match.get('bot_b')) == str((base.get('bot') or {}).get('id')):
+                        if stream is None and match.get('status') == 'pending' and str(match.get('bot_b')) == str((base.get('bot') or {}).get('id')):
                             poll_now = True   # an invitation: accept on fresh slot counts (bot.games_now), as before v1.4.10
                         now_ms = event.get('server_now_ms')
                         if type(now_ms) in (int, float) and server_clock is not None and now_ms >= server_clock[0]:
@@ -1682,56 +1730,60 @@ def main():
                 overdue = planner.overdue_echoes(now)
                 if overdue and stream_ok:
                     for key in overdue:
-                        log('No stream echo of the move for match %s leg %s revision %s within %.1fs; polling now.'
-                            % (key[0], key[1], key[2], ECHO_WAIT_SEC))
-                    poll_now = True
+                        log('No stream echo of the move for match %s leg %s revision %s within %.1fs; %s.'
+                            % (key[0], key[1], key[2], planner.echo_wait, 'polling now' if stream is None else 'resyncing'))
+                    if stream is None:
+                        poll_now = True
                 if state_due is not None and now >= state_due:
-                    log('No state from the event stream within %.0fs of connecting; polling.' % STATE_WAIT_SEC)
+                    log('No state from the event stream within %.0fs of connecting; %s.' % (STATE_WAIT_SEC, 'polling' if stream is None else 'resyncing'))
                     state_due = None
                     poll_now = True
-                poll_due = poll_now or base is None or last_poll is None or now - last_poll >= poll_every
-                low_ids, waiting_now = [], []
-                if stream_ok and base is not None:
-                    my_id_now = (base.get('bot') or {}).get('id')
-                    waiting_now = waiting_clocks(base, my_id_now)
-                    low_ids = [m for m, at in planner.low_clock_plan(waiting_now, last_poll or now).items() if at <= now]
-                low_only = bool(low_ids) and not poll_due   # counted against the low-clock limit only when it adds a poll
-                poll_due = poll_due or bool(low_ids)
-                if poll_due and (base is None or time.monotonic() >= poll_not_before):
-                    poll_now = True   # stays set if the poll fails, so the next round polls again
-                    poll_started = time.monotonic()
-                    try:
-                        # v1.5.0: scope "active" returns this bot and its ongoing games only (a few KB per game), the same
-                        # content as the stream state; history "brief" stays for a server that does not know scope.
-                        polled_base = api.call('agent_poll', environment=reported_environment(), history='brief', scope='active')
-                    except APIError as error:
-                        # A finished move must not wait behind a failing poll: send it from the last known state
-                        # (the server checks the revision) and poll again on its own short schedule.
-                        if not (error.transient and base is not None and any(f.done() for f, _ in jobs.values())):
-                            raise
-                        poll_failures += 1
-                        wait = retry_delay(poll_failures, error.retry_after)
-                        poll_not_before = time.monotonic() + wait
-                        print('Poll failed (%s); sending the finished move from the last known state, next poll in %.2fs.'
-                              % (describe_error(error, api.token), wait), file=sys.stderr)
-                    else:
-                        base, poll_failures, poll_not_before = polled_base, 0, 0.0
-                        last_poll, poll_now = time.monotonic(), False
-                        for polled in base.get('matches', []):
-                            if isinstance(polled, dict) and polled.get('status') == 'running':
-                                seen[polled.get('id')] = ('poll', last_poll)
-                        now_ms = base.get('server_now_ms')
-                        server_clock = (now_ms, last_poll) if type(now_ms) in (int, float) else None
-                        poll_clock = (now_ms, (poll_started + last_poll) / 2) if type(now_ms) in (int, float) else poll_clock
-                        planner.note_poll(base.get('matches') or [], poll_started, last_poll)
-                        if low_only:
-                            for match_id in planner.count_low_poll(planner.counted_matches(waiting_now, low_ids)):
-                                log('Low-clock polls for match %s reached the limit (%d); only the 10s safety poll is left for it.'
-                                    % (match_id, LOW_CLOCK_POLLS_PER_MATCH))
+                if stream is not None:
+                    # v1.5.0 (bot API v2): no agent_poll. Report the environment with agent_environment at start and when the
+                    # engine reports new values, and resync by reconnecting the stream instead of polling.
+                    current_env = reported_environment()
+                    if current_env != env_sent and now >= env_next:
+                        env_next = now + ENV_REPORT_EVERY_SEC
+                        try:
+                            reply = api.call('agent_environment', environment=current_env)
+                            env_sent = current_env
+                            if base is not None and isinstance(reply.get('bot'), dict):
+                                base['bot'] = reply['bot']
+                        except APIError as error:
+                            if not error.transient:
+                                raise
+                            log('Environment report failed (%s); trying again in %ds.' % (describe_error(error, api.token), ENV_REPORT_EVERY_SEC))
+                    reasons = []
+                    if poll_now:
+                        reasons.append('state needed')
+                        poll_now = False
+                    if overdue and stream_ok:
+                        reasons.append('no echo of the move')
+                    if base is not None and stream_ok:
+                        for match_id, _leg, clock_ms in waiting_clocks(base, (base.get('bot') or {}).get('id')):
+                            count, asked = quiet_resyncs.get(match_id, (0, 0.0))
+                            since = max(planner.state_at.get(match_id, now), asked)
+                            if count < QUIET_RESYNCS_PER_MATCH and now - since >= quiet_resync_after(clock_ms):
+                                quiet_resyncs[match_id] = (count + 1, now)   # counted even when the budget skips it
+                                reasons.append('match %s quiet for %.0fs while waiting on the opponent' % (match_id, now - since))
+                                break
+                        live = {m.get('id') for m in base['matches'] if isinstance(m, dict)}
+                        for match_id in [m for m in quiet_resyncs if m not in live]:
+                            del quiet_resyncs[match_id]
+                    if reasons:
+                        resync_times[:] = [t for t in resync_times if now - t < RESYNC_WINDOW_SEC]
+                        if len(resync_times) < RESYNC_BUDGET and stream.healthy:
+                            resync_times.append(now)
+                            stream.request_resync(', '.join(reasons))
+                        elif len(resync_times) >= RESYNC_BUDGET:
+                            log('Resync skipped (%s): %d reconnects in the last %d minutes already.'
+                                % (', '.join(reasons), RESYNC_BUDGET, RESYNC_WINDOW_SEC // 60))
+                    if base is None:
+                        raise WaitingForState()
                 payload = base
                 if server_clock is not None:
                     payload['server_now_ms'] = server_clock[0] + int((time.monotonic() - server_clock[1]) * 1000)
-                challenge = incoming_challenge(payload, payload['bot']['id'], args.once_match)
+                challenge = incoming_challenge(payload, payload['bot']['id'], args.once_match, use_games_now=stream is None)
                 if args.once_match is not None:
                     payload['matches'] = [m for m in payload.get('matches', []) if str(m.get('id')) == str(args.once_match)]
                     if args.once_match < 0:
@@ -1874,20 +1926,33 @@ def main():
                 if stream_ok and time.monotonic() - stream.last_line >= STREAM_SILENCE_SEC:
                     stream.mark_silent()   # open but silent: down until the reader connects again
                     stream_ok = False
-                if stream_ok:
-                    # Safety poll only: stream events and engine answers wake us earlier. v1.4.10: 30s during a game
-                    # (10s before); a leg waiting on the opponent is covered by the waiting-leg polls (PollPlanner),
-                    # which keep 10s for the 1-minute bot-match clocks once that match has been quiet. Idle 60s.
+                if stream is not None:
+                    poll_every = 30.0   # v1.5.0: no polls with the stream; wake at least this often to look around
+                elif stream_ok:
                     poll_every = SAFETY_POLL_GAME_SEC if active else SAFETY_POLL_IDLE_SEC
                 else:
                     poll_every = 1 if active or busy else 5
                 now = time.monotonic()
-                delay = poll_every - (now - last_poll)
+                delay = poll_every - (now - (last_poll or now)) if stream is None else poll_every
                 if poll_now or delay <= 0:
                     delay = max(delay, poll_not_before - now)   # a due poll may be held back after a failure
                 if move_retry:
                     delay = min(delay, min(r['at'] for r in move_retry.values()) - now)
-                if stream_ok:
+                if stream is not None and stream_ok:
+                    # v1.5.0: wake for a due echo, a due quiet-board resync and to notice silence.
+                    extra = [planner.next_echo_at()]
+                    for match_id, _leg, clock_ms in waiting_clocks(payload, my_id):
+                        count, asked = quiet_resyncs.get(match_id, (0, 0.0))
+                        if count < QUIET_RESYNCS_PER_MATCH:
+                            at = max(planner.state_at.get(match_id, now), asked) + quiet_resync_after(clock_ms)
+                            extra.append(max(at, now + 0.2))
+                    if reported_environment() != env_sent:
+                        extra.append(env_next)
+                    for at in extra:
+                        if at is not None:
+                            delay = min(delay, at - now)
+                    delay = min(delay, stream.last_line + STREAM_SILENCE_SEC - now)
+                elif stream_ok:
                     # v1.4.9: wake for a due echo or low-clock poll (never before a held-back poll) and to notice silence.
                     extra = list(planner.low_clock_plan(waiting_clocks(payload, my_id), last_poll).values())
                     extra.append(planner.next_echo_at())
@@ -1898,6 +1963,10 @@ def main():
                 if state_due is not None:
                     delay = min(delay, state_due - now)   # poll if the announced state does not come
                 start = time.monotonic()
+            except WaitingForState:
+                delay = 0.5   # v1.5.0: nothing to do before the stream sends the state
+                if state_due is not None:
+                    delay = min(delay, max(0.05, state_due - time.monotonic()))
             except PermissionError:
                 print('Bot credential rejected. Stopping.', file=sys.stderr)
                 return 2
