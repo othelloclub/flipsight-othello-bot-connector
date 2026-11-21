@@ -14,7 +14,7 @@ Credentials stay in FS_BOT_TOKEN. Engine modes:
   --engine-ponder on lets Edax (xboard) and Egaroucid (-ponder) think in the opponent's time; both report the
   actual setting. With other engines both options only report the setting.
 The connector listens to the event stream (/flipsight_api/bot-stream) and reacts to opponent moves
-immediately. Since v1.5.0 (FlipSight bot API v2, shaped like the Lichess bot API: agent_poll is removed on
+immediately. Since v1.5.0 (FlipSight bot API v2: agent_poll is removed on
 2026-11-22 00:00 UTC+9) the state comes only from the stream and the connector never calls agent_poll: right after
 hello the server sends this bot's state (type "state": the bot and its ongoing games), and every match event carries
 this bot's own view (view "agent"), so the engine starts and its move is sent at once. The environment goes with
@@ -33,11 +33,19 @@ and the stream are opened again (a changed network path leaves the old ones dead
 server moved on, often because the first try arrived) is dropped on its own while the other boards go on, and the
 stream is reconnected only if that match has no news within 1s. Reconnects asked for are merged: none while one is
 under way or within 3s of the last one.
+v1.5.2: --save-games DIR keeps every finished game: the server's game record (format 1, one JSON line per game, the
+same object as the record of a finished match event and each line of agent_games) goes to DIR/games-YYYY-MM.ndjson.
+Games that ended while the connector was stopped or the stream was down, and games against people whose record was
+not ready yet, are filled with agent_games in a background thread on its own connection (from the newest saved game;
+an empty folder starts from now). A game that changes later (a technical void) is written again; the last line wins.
 """
 import argparse
 import email.utils
+import glob
+import gzip
 import concurrent.futures
 import http.client
+import io
 import json
 import math
 import os
@@ -57,7 +65,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = '1.5.1'
+VERSION = '1.5.2'
 WINDOWS = os.name == 'nt'
 DIRECTIONS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 # Temporary errors during a game: the first FAST_RETRIES tries wait 0.2-0.5s, later ones back off 2, 4, ... 30s.
@@ -96,6 +104,13 @@ ENV_REPORT_EVERY_SEC = 30
 SAFETY_POLL_GAME_SEC = 60   # v1.5.0 (bot API v2): 60s; the waiting-leg polls still cover a quiet board after 10s
 SAFETY_POLL_IDLE_SEC = 60
 STATE_WAIT_SEC = 3.0
+# v1.5.2 --save-games: agent_games pages (100 records stay well under the 1 MB response limit even uncompressed), the
+# server's limit of one agent_games call per bot every 5s, and how long after a finished game without a record (a game
+# against a person whose record was not ready yet) to fill again.
+GAMES_FILL_MAX = 100
+GAMES_FILL_GAP_SEC = 5.5
+GAMES_LATE_RECORD_SEC = 15.0
+GAMES_FILL_TRIES = 3
 
 
 def log(message):
@@ -251,9 +266,36 @@ class API:
         raise RuntimeError('unreachable')
 
     def call(self, action, timeout=8.0, **fields):
+        body = self.send(action, timeout, 'application/json', fields)[0]
+        data = json.loads(body)
+        if not isinstance(data, dict) or data.get('ok') is not True:
+            raise RuntimeError('API rejected request')
+        return data
+
+    def games(self, timeout=20.0, **fields):
+        """v1.5.2: agent_games. The answer is NDJSON, one game record per line (gzip when the server compresses it)."""
+        body, headers = self.send('agent_games', timeout, 'application/x-ndjson', fields, gzip_ok=True)
+        if (headers.get('Content-Encoding') or '').lower() == 'gzip':
+            with gzip.GzipFile(fileobj=io.BytesIO(body)) as packed:
+                body = packed.read(16 * 1024 * 1024 + 1)
+            if len(body) > 16 * 1024 * 1024:
+                raise RuntimeError('response too large')
+        records = []
+        for line in body.splitlines():
+            if line.strip():
+                record = json.loads(line)
+                if isinstance(record, dict):
+                    records.append(record)
+        return records
+
+    def send(self, action, timeout, accept, fields, gzip_ok=False):
+        """One authenticated POST; returns (body, response headers). Errors as in call()."""
         body = json.dumps(dict(action=action, **fields)).encode()
-        headers = {'Authorization': 'Bearer ' + self.token, 'Content-Type': 'application/json', 'Accept': 'application/json',
+        headers = {'Authorization': 'Bearer ' + self.token, 'Content-Type': 'application/json', 'Accept': accept,
                    'User-Agent': 'Python-urllib/%d.%d' % sys.version_info[:2]}
+        if gzip_ok:
+            headers['Accept-Encoding'] = 'gzip'
+        response_headers = {}
         if self.keep_alive:
             try:
                 with self.lock:
@@ -272,6 +314,7 @@ class API:
             try:
                 with self.opener.open(request, timeout=timeout) as response:
                     body = response.read(1024 * 1024 + 1)
+                    response_headers = response.headers
             except urllib.error.HTTPError as error:
                 # Never log response bodies: a proxy could echo the authorization header.
                 if error.code in (401, 403):
@@ -282,10 +325,140 @@ class API:
             self.last_reused = False
         if len(body) > 1024 * 1024:
             raise RuntimeError('response too large')
-        data = json.loads(body)
-        if not isinstance(data, dict) or data.get('ok') is not True:
-            raise RuntimeError('API rejected request')
-        return data
+        return body, response_headers
+
+
+def game_record(match):
+    """v1.5.2: the server's game record carried by the last event of a finished match (format 1), or None."""
+    record = match.get('record') if isinstance(match, dict) else None
+    if (isinstance(record, dict) and record.get('format') == 1 and record.get('kind') in ('bot', 'human')
+            and type(record.get('id')) is int and type(record.get('updated_ms')) is int):
+        return record
+    return None
+
+
+class GameSaver:
+    """v1.5.2 --save-games: one JSON line per finished game in DIR/games-YYYY-MM.ndjson (month of updated_ms, local time).
+
+    A game is keyed by kind and id. A record already saved with the same or a newer updated_ms is skipped; a newer one
+    (a game changed later, such as a technical void) is written again, so the last line of a game wins. Lines of the two
+    newest files are read at start. Used by the main loop and the filling thread."""
+
+    def __init__(self, folder):
+        self.folder = folder
+        self.lock = threading.Lock()
+        self.saved = {}
+        self.newest = 0
+        os.makedirs(folder, exist_ok=True)
+        files = sorted(glob.glob(os.path.join(glob.escape(folder), 'games-*.ndjson')))
+        if files:
+            # A crash in the middle of a write leaves the last line without its newline: end it so the next record
+            # starts on its own line (the cut line is skipped below and its game comes again from agent_games).
+            with open(files[-1], 'rb+') as last:
+                last.seek(0, os.SEEK_END)
+                if last.tell():
+                    last.seek(-1, os.SEEK_END)
+                    if last.read(1) != b'\n':
+                        last.write(b'\n')
+        for path in files[-2:]:
+            with open(path, encoding='utf-8') as lines:
+                for line in lines:
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        continue   # a line cut short by a crash: the record comes again from agent_games
+                    if isinstance(record, dict) and type(record.get('updated_ms')) is int:
+                        key = (record.get('kind'), record.get('id'))
+                        self.saved[key] = max(self.saved.get(key, 0), record['updated_ms'])
+                        self.newest = max(self.newest, record['updated_ms'])
+
+    def save(self, record):
+        """Write the record unless this version is saved already. Returns True when a line was written."""
+        key, updated = (record['kind'], record['id']), record['updated_ms']
+        line = json.dumps(record, ensure_ascii=False, separators=(',', ':')) + '\n'
+        path = os.path.join(self.folder, time.strftime('games-%Y-%m.ndjson', time.localtime(updated / 1000)))
+        with self.lock:
+            if self.saved.get(key, -1) >= updated:
+                return False
+            with open(path, 'a', encoding='utf-8', newline='\n') as out:
+                out.write(line)
+            self.saved[key] = updated
+            self.newest = max(self.newest, updated)
+        return True
+
+
+class GameFiller(threading.Thread):
+    """v1.5.2 --save-games: fills games the stream did not bring (the connector was stopped or the stream was down, or a
+    game against a person ended before its record was ready) with agent_games, from the newest saved game. Runs on its
+    own HTTPS connection so a fill never delays a move, and keeps the server's limit of one call per 5s."""
+
+    def __init__(self, url, token, saver, start_ms):
+        super().__init__(name='game-filler', daemon=True)
+        self.api = API(url, token)
+        self.saver, self.start_ms = saver, start_ms
+        self.lock = threading.Lock()
+        self.due = None
+        self.wake = threading.Event()
+        self.stopping = threading.Event()
+        self.last_call = -1e9
+
+    def request(self, delay=0.0):
+        with self.lock:
+            at = time.monotonic() + delay
+            self.due = at if self.due is None else min(self.due, at)
+        self.wake.set()
+
+    def run(self):
+        while not self.stopping.is_set():
+            with self.lock:
+                due = self.due
+            if due is None or time.monotonic() < due:
+                self.wake.wait(1.0 if due is None else max(0.05, due - time.monotonic()))
+                self.wake.clear()
+                continue
+            with self.lock:
+                self.due = None
+            try:
+                self.fill()
+            except PermissionError:
+                log('Game records: bot credential rejected; filling stops.')
+                return
+            except Exception as error:   # never let saving games stop the connector
+                log('Game records: fill failed (%s).' % describe_error(error, self.api.token))
+        self.api.close()
+
+    def fill(self):
+        since = self.saver.newest or self.start_ms
+        written, tries = 0, 0
+        while not self.stopping.is_set():
+            gap = self.last_call + GAMES_FILL_GAP_SEC - time.monotonic()
+            if gap > 0 and self.stopping.wait(gap):
+                return
+            self.last_call = time.monotonic()
+            try:
+                records = self.api.games(since=since, max=GAMES_FILL_MAX)
+            except PermissionError:
+                raise
+            except Exception as error:
+                tries += 1
+                if tries >= GAMES_FILL_TRIES:
+                    log('Game records: agent_games failed %d times (%s); trying again at the next reconnect or finished game.'
+                        % (tries, describe_error(error, self.api.token)))
+                    return
+                continue
+            new = 0
+            for record in records:
+                record = game_record({'record': record})
+                if record is not None and self.saver.save(record):
+                    new += 1
+            written += new
+            newest = max([r['updated_ms'] for r in records if isinstance(r, dict) and type(r.get('updated_ms')) is int] or [since])
+            # since is inclusive (the last saved game comes again): stop when a page brings nothing new or is not full.
+            if new == 0 or len(records) < GAMES_FILL_MAX or newest <= since:
+                break
+            since = newest
+        if written:
+            log('Game records: filled %d game(s) with agent_games.' % written)
 
 
 class WaitingForState(Exception):
@@ -1473,6 +1646,11 @@ def main():
     parser.add_argument('--max-think-seconds', type=float, default=10, help='Optional per-turn cap; default 10s, 0 uses the remaining game clock')
     parser.add_argument('--once-match', type=int, help='Only process this match; exit when finished, aborted, expired or rejected')
     parser.add_argument('--max-runtime', type=float, help='Stop after this many seconds (engine cleanup follows)')
+    parser.add_argument('--save-games', metavar='DIR', help='Save every finished game (the server game record, one JSON line '
+                        'per game) in DIR/games-YYYY-MM.ndjson. Games that ended while the connector was stopped or the stream '
+                        'was down are filled with agent_games from the newest saved game; an empty folder starts from now. '
+                        'Off by default: nothing is saved without it. A game takes about 4 KB (about 6 KB on 10x10), so 1,400 '
+                        'games a day come to about 6 MB a day and 180 MB a month; delete old month files yourself')
     parser.add_argument('--timing-log', metavar='PATH', help='Append one line per submitted move with where the time went '
                         '(update seen, waiting for a search slot, engine, submitting); off by default')
     args = parser.parse_args()
@@ -1563,6 +1741,16 @@ def main():
             stream_url += '?state=1'
     except ValueError as error:
         parser.error(str(error))
+
+    # v1.5.2: --save-games. The folder is checked (and its newest saved game read) before anything is started.
+    saver, filler = None, None
+    if args.save_games:
+        try:
+            saver = GameSaver(args.save_games)
+        except OSError as error:
+            parser.error('cannot use --save-games folder: %s' % error)
+        filler = GameFiller(args.api, token, saver, int(time.time() * 1000))
+        filler.start()
 
     wake = threading.Event()
     events = queue.SimpleQueue()
@@ -1719,6 +1907,8 @@ def main():
                             continue
                         base = merge_state(base, event)
                         poll_now = False
+                        if filler is not None:
+                            filler.request()   # v1.5.2: after (re)connecting, fill games that ended while the stream was down
                         if last_poll is not None:   # the first poll at start still goes out: it reports the environment
                             last_poll = received
                         server_clock = (event['server_now_ms'], received)
@@ -1735,6 +1925,15 @@ def main():
                     if apply_stream_event(base, event):
                         match = event['match']
                         seen[match['id']] = ('event', received)
+                        if saver is not None and match.get('status') in ('finished', 'aborted'):
+                            record = game_record(match)
+                            try:
+                                if record is not None:
+                                    saver.save(record)
+                                else:
+                                    filler.request(GAMES_LATE_RECORD_SEC)   # record not ready (or an older server): fill later
+                            except OSError as error:
+                                log('Game records: cannot save match %s (%s).' % (match.get('id'), error))
                         if any(m is match for m in base['matches']):
                             planner.note_event(match, received)
                         if stream is None and match.get('status') == 'pending' and str(match.get('bot_b')) == str((base.get('bot') or {}).get('id')):
@@ -2069,6 +2268,9 @@ def main():
             signal.signal(signal.SIGTERM, previous_term)
         if stream is not None:
             stream.stopping.set()
+        if filler is not None:
+            filler.stopping.set()
+            filler.wake.set()
         for future, cancel in jobs.values():
             cancel.set()
         executor.shutdown(wait=True, cancel_futures=True)
