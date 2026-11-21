@@ -38,6 +38,10 @@ same object as the record of a finished match event and each line of agent_games
 Games that ended while the connector was stopped or the stream was down, and games against people whose record was
 not ready yet, are filled with agent_games in a background thread on its own connection (from the newest saved game;
 an empty folder starts from now). A game that changes later (a technical void) is written again; the last line wins.
+v1.5.3: the engine's evaluation goes with each move in bot matches (agent_move "eval", discs from the mover's side,
+within the game's playable squares; never in games against people): "eval" in a JSON reply or the NBoard score.
+v1.5.4: --edax (xboard) sends the score of Edax's own search line for the move it plays, and --egaroucid starts
+Egaroucid with -showvalue and sends the value it prints after the move. Moves and engine time are unchanged.
 """
 import argparse
 import email.utils
@@ -65,7 +69,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = '1.5.3'
+VERSION = '1.5.4'
 WINDOWS = os.name == 'nt'
 DIRECTIONS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 # Temporary errors during a game: the first FAST_RETRIES tries wait 0.2-0.5s, later ones back off 2, 4, ... 30s.
@@ -1176,6 +1180,27 @@ def xboard_square(square):
     return '@@@@' if square == -1 else 'abcdefgh'[square % 8] + str(square // 8 + 1)
 
 
+START_BOARD = [2 if i in (27, 36) else 1 if i in (28, 35) else 0 for i in range(64)]   # d4, e5 White; e4, d5 Black
+
+
+def edax_line_eval(line, move):
+    """v1.5.4: the evaluation in Edax's xboard search line "depth score time nodes [@sel%] pv" (score in hundredths
+    of a disc from the side to move), or None. The line counts only when its PV starts with this move in lowercase,
+    Edax's own colour in every leg (edax_xboard_fen); a line left from pondering another position starts otherwise."""
+    parts = line.split()
+    if len(parts) < 5 or not parts[0].isdigit():
+        return None
+    try:
+        score = int(parts[1])
+    except ValueError:
+        return None
+    pv = parts[5:] if parts[4].startswith('@') else parts[4:]
+    first = pv[0].strip('()') if pv else ''
+    if first != xboard_square(move):
+        return None
+    return engine_eval(score / 100)
+
+
 def edax_xboard_fen(board, me):
     """Edax's xboard FEN with Edax to move. Edax stones are always the lowercase side 'p' with 'b' to move, so Edax
     plays its internal first colour in every leg: the clock slot that "time" fills after "new" and "force" (see EdaxEngine).
@@ -1299,10 +1324,15 @@ class EdaxEngine(NBoardEngine):
                         commands = ('force', 'hard' if self.ponder else 'easy',
                                     'setboard ' + edax_xboard_fen(request['board'], request['color'])) + clocks + ('go',)
                     self._send(*commands)
+                    lines = []   # v1.5.4: Edax's search lines after these commands; the last one before "move" is this search's
                     def accept(text):
                         if text.startswith('Illegal move'):
                             raise EdaxOutOfStep('Edax rejected a move')
-                        return text[5:].strip() if text.startswith('move ') else None
+                        if text.startswith('move '):
+                            return text[5:].strip()
+                        if text[:1].isdigit():
+                            lines.append(text)
+                        return None
                     soft_deadline = deadline - min(.2, max(0, deadline - time.monotonic()) * .25)
                     try:
                         reply = self._read_until(accept, soft_deadline, cancel)
@@ -1315,7 +1345,9 @@ class EdaxEngine(NBoardEngine):
                         raise EdaxOutOfStep('Edax answered for another position')
                     self.known = (play_square(request['board'], request['color'], move), 3 - request['color'],
                                   len(request.get('history') or []) + 1)
-                    return move
+                    # The first move from the start position is Edax's fixed opening (f5 or its mirror) without a search line.
+                    evaluation = edax_line_eval(lines[-1], move) if lines and request['board'] != START_BOARD else None
+                    return move if evaluation is None else (move, evaluation)
                 except EdaxOutOfStep:
                     # Start again from the server position once; a second mismatch is an engine failure.
                     self.stop()
@@ -1374,13 +1406,20 @@ class EgaroucidEngine(NBoardEngine):
                     self._send('settime %s %d' % (color, max(0, left_ms // 1000)))
                 self._send('go')
                 def accept(text):
-                    if len(text) == 2 and text[0].lower() in 'abcdefgh' and text[1] in '12345678':
-                        return square_index(text)
-                    if text.lower() in ('ps', 'pa', 'pass'):
-                        return -1
-                    return None
+                    # v1.5.4: -showvalue adds the value after the move ("f5 2": discs, the mover's side).
+                    word, _, value = text.partition(' ')
+                    if len(word) == 2 and word[0].lower() in 'abcdefgh' and word[1] in '12345678':
+                        move = square_index(word)
+                    elif word.lower() in ('ps', 'pa', 'pass'):
+                        move = -1
+                    else:
+                        return None
+                    try:
+                        return move, engine_eval(float(value)) if value.strip() else None
+                    except ValueError:
+                        return move, None
                 try:
-                    move = self._read_until(accept, deadline, cancel)
+                    move, evaluation = self._read_until(accept, deadline, cancel)
                 except TimeoutError:
                     # Native console has no asynchronous stop command. Never reuse an
                     # unfinished search: stop it and submit a legal emergency move.
@@ -1391,7 +1430,7 @@ class EgaroucidEngine(NBoardEngine):
                     return next((m for m in legal if m in (0, 7, 56, 63)), legal[0])
                 if move not in legal:
                     raise ValueError('Egaroucid returned an illegal move')
-                return move
+                return move if evaluation is None else (move, evaluation)
             except BaseException:
                 self.stop()
                 raise
@@ -1732,7 +1771,7 @@ def main():
             command = [executable, '-xboard' if xboard else '-nboard', '-eval-file', evaluation, '-n-tasks', str(threads),
                        '-ponder', 'on' if xboard and args.engine_ponder == 'on' else 'off'] + (hash_args or [])
         elif args.egaroucid:
-            command = [native_executable(args.egaroucid), '-quiet', '-noboard', '-thread', str(threads)] + (hash_args or ['-hash', '20'])
+            command = [native_executable(args.egaroucid), '-quiet', '-noboard', '-showvalue', '-thread', str(threads)] + (hash_args or ['-hash', '20'])
             if args.engine_ponder == 'on':
                 command.append('-ponder')
             if args.egaroucid_level:
