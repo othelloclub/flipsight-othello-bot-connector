@@ -15,6 +15,7 @@ It works with **Edax**, **Egaroucid**, any engine that speaks the **NBoard proto
 - **Moves get through (v1.4.4):** if the server answers a move with a temporary error (too many requests, 5xx, timeout or a dropped connection), the connector sends the same move again after 0.2 to 0.5 s while the game clock allows, and the log line shows the cause.
 - **Edax runs its own clock (v1.4.8):** `--edax` now connects over xboard. Edax decides its thinking time from both game clocks, keeps its game and hash table through the board, and can ponder with `--engine-ponder on`. `--edax-protocol nboard` keeps the older NBoard connection.
 - **Catches a stuck stream (v1.4.9):** if the event stream stays connected but goes silent for 15 s, the connector connects again and polls every second meanwhile. It also polls when its own move does not come back on the stream within 1 s, and more often when your clock is under 30 s, so a missed opponent move costs far less of a short clock than the regular 10 s poll.
+- **Handles the server's closing notice (v1.5.4):** after `overflow` or `server_shutdown` the connector connects again at once. After `replaced` (the same bot token runs somewhere else) it logs a warning and waits 30 to 60 s, longer when it repeats, so two copies no longer close each other every few seconds.
 - **Sends your evaluation (v1.5.3):** in bot matches the engine's evaluation goes with the move and shows in the game room. `--edax`, `--egaroucid` and NBoard engines send it by themselves from v1.5.3. A custom JSON adapter adds `"eval"` (its evaluation after the move, in discs from its own side).
 - **Keeps your games (v1.5.2):** `--save-games DIR` writes every finished game to `DIR/games-YYYY-MM.ndjson`, one JSON line per game (the server's game record: opponent, result, ratings, opening, both boards' moves with times). Games that ended while the connector was stopped or the stream was down are filled with `agent_games` when it reconnects. Off by default; about 4 KB per game (about 6 MB a day at 1,400 games).
 - **Faster recovery after a network blip (v1.5.1):** a move POST waits at most a third of that board's clock (1.5 to 8 s); after a timeout the HTTPS connection and the stream are opened again. A move refused with HTTP 409 (often because the first try did arrive) is dropped on its own while the other board goes on, and reconnects are merged (none while one is under way or within 3 s of the last). In a test where the network path stopped for 6 s, the first move after it came 0.3 s later instead of 3.4 s, and a 9 s slow answer no longer cost both boards.
@@ -126,6 +127,14 @@ python3 bot_match_client.py --engine-threads 2 --engine-ponder on --edax "edax/l
 한국어: v1.4.8부터 `--edax`는 Edax를 xboard 방식으로 실행합니다. 매 수 전에 양쪽 남은 시간을 보내고 생각할 시간은 Edax가 정하며, 판 안에서는 기보와 해시를 이어 씁니다. `--engine-ponder on`이면 상대 차례에도 탐색합니다. 예전 연결은 `--edax-protocol nboard`입니다.
 
 日本語: v1.4.8から `--edax` は Edax を xboard 方式で起動します。毎手の前に双方の残り時間を送り、考える時間は Edax が決め、局の途中は棋譜とハッシュを引き継ぎます。`--engine-ponder on` なら相手の手番中も探索します。従来の接続は `--edax-protocol nboard` です。
+
+### Server closing notice (v1.5.4)
+
+v1.5.4 reads the `closing` line the server sends just before it closes the stream. After an `overflow` of unsent lines or a `server_shutdown` restart, it connects again at once and gets the state again. `replaced` means another connector opened a stream with the same bot token, so it logs a warning and connects again after 30 to 60 s. From the third time within 10 minutes the wait doubles each time, up to 15 minutes. Run each bot token in one place only.
+
+한국어: v1.5.4 는 서버가 스트림을 닫기 직전에 보내는 `closing` 줄을 읽습니다. 까닭이 줄 넘침인 `overflow` 나 서버 재시작인 `server_shutdown` 이면 바로 다시 연결해 상태를 새로 받습니다. `replaced` 는 같은 봇 토큰으로 다른 연결기가 스트림을 열었다는 뜻이라, 경고를 남기고 30~60초 뒤에 다시 연결합니다. 10분 안에 세 번째부터는 기다림이 두 배씩 늘어 최대 15분이 됩니다. 봇 토큰 하나는 한 곳에서만 돌리세요.
+
+日本語: v1.5.4 はサーバーがストリームを閉じる直前に送る `closing` 行を読みます。理由が送れなかった行があふれた `overflow` か、サーバー再起動の `server_shutdown` なら、すぐに接続し直して状態を受け取り直します。`replaced` は同じボットトークンで別の接続プログラムがストリームを開いたという意味なので、警告を残して30〜60秒後に接続し直します。10分以内の3回目からは待ち時間が毎回2倍になり、最大15分になります。ボットトークン1つは1か所だけで動かしてください。
 
 ### Sending your evaluation (v1.5.3)
 

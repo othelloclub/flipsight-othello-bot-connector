@@ -42,6 +42,12 @@ v1.5.3: the engine's evaluation goes with each move in bot matches (agent_move "
 within the game's playable squares; never in games against people): "eval" in a JSON reply, the NBoard score, the
 score of Edax's own xboard search line for the move it plays, and the value Egaroucid prints after the move when it
 is started with -showvalue. Moves and engine time are unchanged.
+v1.5.4: the server's last line before it closes the stream (type "closing", 2026-11-22) is read. overflow (lines piled
+up and were dropped) and server_shutdown reconnect at once like a resync; the state comes again after hello, and tries
+that fail while the server restarts use the usual backoff. replaced means another connector with this bot's token
+opened a new stream: a warning is logged and the connector waits 30-60s before connecting again, so two copies no
+longer close each other every few seconds; from the 3rd time in 10 minutes the wait doubles each time up to 7.5-15
+minutes, and a connection that stays up 10 minutes clears the count. Unknown reasons reconnect as any other close.
 """
 import argparse
 import email.utils
@@ -69,7 +75,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = '1.5.3'
+VERSION = '1.5.4'
 WINDOWS = os.name == 'nt'
 DIRECTIONS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 # Temporary errors during a game: the first FAST_RETRIES tries wait 0.2-0.5s, later ones back off 2, 4, ... 30s.
@@ -103,6 +109,18 @@ OPP_CLOCK_RESYNCS_PER_MATCH = 1
 #    connection is new (API.post closes it) and the stream is reconnected too, as both ran on the dead path.
 CONFLICT_NEWS_SEC = 1.0
 RESYNC_MERGE_SEC = 3.0
+# v1.5.4: the server sends {"type":"closing","reason":...} as the last line before it closes the stream (2026-11-22).
+# "overflow" (64 unsent lines, dropped) and "server_shutdown" reconnect at once like a resync. "replaced" means another
+# connector with this bot's token opened a stream and the server closed this one: reconnecting at once would close that
+# one in turn, and two copies would keep closing each other (and count against the 10 connections in 10 minutes). So
+# wait REPLACED_WAIT_SEC to twice that; from the REPLACED_REPEAT-th time within REPLACED_WINDOW_SEC the wait doubles each
+# time, at most REPLACED_WAIT_MAX_SEC. The connector never stops for good: when the other copy goes away it is back
+# within that wait. A connection that stays up REPLACED_CLEAR_SEC clears the count. Unknown reasons reconnect as before.
+REPLACED_WAIT_SEC = 30.0
+REPLACED_REPEAT = 3
+REPLACED_WINDOW_SEC = 600
+REPLACED_WAIT_MAX_SEC = 900.0
+REPLACED_CLEAR_SEC = 600
 MOVE_POST_TIMEOUT_MIN, MOVE_POST_TIMEOUT_MAX = 1.5, 8.0
 ENV_REPORT_EVERY_SEC = 30
 SAFETY_POLL_GAME_SEC = 60   # v1.5.0 (bot API v2): 60s; the waiting-leg polls still cover a quiet board after 10s
@@ -469,12 +487,21 @@ class WaitingForState(Exception):
     """v1.5.0: the stream has not sent the state yet (no poll to fall back on)."""
 
 
+def closing_reason(value):
+    """v1.5.4: the reason of the server's closing line as short plain text for the log ('?' when missing or odd)."""
+    text = value if isinstance(value, str) else ''
+    return ''.join(c for c in text[:40] if c.isascii() and (c.isalnum() or c in '_-.')) or '?'
+
+
 class EventStream(threading.Thread):
     """Reads NDJSON events, hands hello and match events to the main loop (events queue) and wakes it.
 
     v1.4.9: last_line is the local time of the latest line (pings too) and ping the latest ping as (server_now_ms,
     local time). A connection silent for STREAM_SILENCE_SEC ends by its socket timeout, or by mark_silent() from the
-    main loop, and the reader connects again. Drops, failed tries and reconnects are logged (never the token)."""
+    main loop, and the reader connects again. Drops, failed tries and reconnects are logged (never the token).
+
+    v1.5.4: a "closing" line ends the connection at once. overflow and server_shutdown reconnect after 0.2s (as a
+    resync), replaced waits replaced_wait() seconds, and any other reason goes the usual way (backoff)."""
 
     def __init__(self, url, token, wake, events=None):
         super().__init__(daemon=True)
@@ -488,6 +515,19 @@ class EventStream(threading.Thread):
         self.response = None
         self.silenced = False   # mark_silent() closed the current connection
         self.resync = None      # v1.5.0: reason of a requested reconnect (request_resync), reconnects at once
+        self.replaced = []      # v1.5.4: local times of the recent "replaced" closes (within REPLACED_WINDOW_SEC)
+        self.replaced_level = 0   # v1.5.4: doublings of the wait after replaced; 0 until REPLACED_REPEAT in the window
+
+    def replaced_wait(self, now):
+        """v1.5.4: count a "replaced" close at local time now and return the seconds to wait before connecting again:
+        REPLACED_WAIT_SEC to twice that, doubled once more for each close from the REPLACED_REPEAT-th one within
+        REPLACED_WINDOW_SEC on (the doubling stays until a connection holds REPLACED_CLEAR_SEC), at most
+        REPLACED_WAIT_MAX_SEC. The random part keeps two copies of the connector from coming back together."""
+        self.replaced = [t for t in self.replaced if now - t < REPLACED_WINDOW_SEC] + [now]
+        if self.replaced_level or len(self.replaced) >= REPLACED_REPEAT:
+            self.replaced_level += 1
+        base = min(REPLACED_WAIT_MAX_SEC / 2, REPLACED_WAIT_SEC * 2 ** min(self.replaced_level, 30))
+        return base * (1 + random.random())
 
     def mark_silent(self):
         """The main loop saw no line for STREAM_SILENCE_SEC on a connection that looks open: count the stream as down
@@ -527,6 +567,7 @@ class EventStream(threading.Thread):
         ever_connected, down_since = False, None
         while not self.stopping.is_set():
             connected, reason = False, 'closed by the server'
+            closing, connected_at = None, None   # v1.5.4: reason of the server's closing line; local time of hello
             self.silenced = False
             try:
                 request = urllib.request.Request(self.url, headers={'Authorization': 'Bearer ' + self.token, 'Accept': 'application/x-ndjson'})
@@ -550,6 +591,7 @@ class EventStream(threading.Thread):
                                 else:
                                     log('Event stream connected.')
                                 connected, ever_connected, down_since = True, True, None
+                                connected_at = self.last_line
                             self.healthy, backoff = True, 1.0
                             if self.events is not None:
                                 # A new connection may have missed events: the state that follows on a ?state=1
@@ -564,6 +606,10 @@ class EventStream(threading.Thread):
                             self.wake.set()
                         elif event.get('type') == 'ping' and type(event.get('server_now_ms')) in (int, float):
                             self.ping = (event['server_now_ms'], self.last_line)
+                        elif event.get('type') == 'closing':
+                            # v1.5.4: the server closes the connection right after this line; do not wait for it.
+                            closing = closing_reason(event.get('reason'))
+                            break
             except urllib.error.HTTPError as error:
                 if error.code in (401, 403):
                     self.denied = True
@@ -583,6 +629,29 @@ class EventStream(threading.Thread):
             was_healthy, self.healthy = self.healthy, False
             if was_healthy:
                 self.wake.set()   # fall back to fast polling right away
+            now = time.monotonic()
+            if connected_at is not None and now - connected_at >= REPLACED_CLEAR_SEC:
+                self.replaced, self.replaced_level = [], 0   # v1.5.4: this connection held, so start counting again
+            if closing == 'replaced':
+                # v1.5.4: another copy with this token holds the stream now (and gets the state and plays the games).
+                # Connecting at once would close it in turn; wait, longer when it keeps happening.
+                self.resync, down_since = None, now
+                wait = self.replaced_wait(now)
+                count = len(self.replaced)
+                log("Another connector with this bot's token opened a new stream; this one was closed. Run each bot "
+                    "token in one place only. Connecting again in %.0fs (%d time%s in the last %d minutes)."
+                    % (wait, count, '' if count == 1 else 's', REPLACED_WINDOW_SEC // 60))
+                self.stopping.wait(wait)
+                continue
+            if closing in ('overflow', 'server_shutdown'):
+                # v1.5.4: as a resync. After overflow the new connection's state brings what was dropped; while the
+                # server restarts, failed tries back off as usual.
+                self.resync, down_since = None, now
+                log('Server closing the event stream (%s); reconnecting.' % closing)
+                self.stopping.wait(0.2)
+                continue
+            if closing is not None:
+                reason = 'closed by the server: %s' % closing   # v1.5.4: unknown reason, reconnect as before
             if self.resync is not None:
                 self.resync = None
                 down_since = time.monotonic()
