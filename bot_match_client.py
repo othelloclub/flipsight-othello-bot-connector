@@ -39,9 +39,9 @@ Games that ended while the connector was stopped or the stream was down, and gam
 not ready yet, are filled with agent_games in a background thread on its own connection (from the newest saved game;
 an empty folder starts from now). A game that changes later (a technical void) is written again; the last line wins.
 v1.5.3: the engine's evaluation goes with each move in bot matches (agent_move "eval", discs from the mover's side,
-within the game's playable squares; never in games against people): "eval" in a JSON reply or the NBoard score.
-v1.5.4: --edax (xboard) sends the score of Edax's own search line for the move it plays, and --egaroucid starts
-Egaroucid with -showvalue and sends the value it prints after the move. Moves and engine time are unchanged.
+within the game's playable squares; never in games against people): "eval" in a JSON reply, the NBoard score, the
+score of Edax's own xboard search line for the move it plays, and the value Egaroucid prints after the move when it
+is started with -showvalue. Moves and engine time are unchanged.
 """
 import argparse
 import email.utils
@@ -69,7 +69,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = '1.5.4'
+VERSION = '1.5.3'
 WINDOWS = os.name == 'nt'
 DIRECTIONS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 # Temporary errors during a game: the first FAST_RETRIES tries wait 0.2-0.5s, later ones back off 2, 4, ... 30s.
@@ -1184,7 +1184,7 @@ START_BOARD = [2 if i in (27, 36) else 1 if i in (28, 35) else 0 for i in range(
 
 
 def edax_line_eval(line, move):
-    """v1.5.4: the evaluation in Edax's xboard search line "depth score time nodes [@sel%] pv" (score in hundredths
+    """v1.5.3: the evaluation in Edax's xboard search line "depth score time nodes [@sel%] pv" (score in hundredths
     of a disc from the side to move), or None. The line counts only when its PV starts with this move in lowercase,
     Edax's own colour in every leg (edax_xboard_fen); a line left from pondering another position starts otherwise."""
     parts = line.split()
@@ -1324,7 +1324,7 @@ class EdaxEngine(NBoardEngine):
                         commands = ('force', 'hard' if self.ponder else 'easy',
                                     'setboard ' + edax_xboard_fen(request['board'], request['color'])) + clocks + ('go',)
                     self._send(*commands)
-                    lines = []   # v1.5.4: Edax's search lines after these commands; the last one before "move" is this search's
+                    lines = []   # v1.5.3: Edax's search lines after these commands; the last one before "move" is this search's
                     def accept(text):
                         if text.startswith('Illegal move'):
                             raise EdaxOutOfStep('Edax rejected a move')
@@ -1406,7 +1406,7 @@ class EgaroucidEngine(NBoardEngine):
                     self._send('settime %s %d' % (color, max(0, left_ms // 1000)))
                 self._send('go')
                 def accept(text):
-                    # v1.5.4: -showvalue adds the value after the move ("f5 2": discs, the mover's side).
+                    # v1.5.3: -showvalue adds the value after the move ("f5 2": discs, the mover's side).
                     word, _, value = text.partition(' ')
                     if len(word) == 2 and word[0].lower() in 'abcdefgh' and word[1] in '12345678':
                         move = square_index(word)
