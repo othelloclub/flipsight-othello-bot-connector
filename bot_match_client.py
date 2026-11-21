@@ -65,7 +65,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = '1.5.2'
+VERSION = '1.5.3'
 WINDOWS = os.name == 'nt'
 DIRECTIONS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 # Temporary errors during a game: the first FAST_RETRIES tries wait 0.2-0.5s, later ones back off 2, 4, ... 30s.
@@ -961,12 +961,40 @@ class PersistentJsonEngine:
                     timing.update({key: request[key] for key in ('match_id', 'leg', 'revision', 'remaining_ms')
                                    if type(request.get(key)) is int})
                     print('Engine time: ' + json.dumps(timing), file=sys.stderr, flush=True)
-                return move
+                # v1.5.3: optional "eval" (discs, the mover's side) goes with agent_move; anything else is ignored.
+                evaluation = engine_eval(answer.get('eval'))
+                return move if evaluation is None else (move, evaluation)
         except BaseException:
             self.stop()
             raise
         finally:
             self.lock.release()
+
+
+def engine_eval(value, limit=100):
+    """v1.5.3: an engine's evaluation of its move in discs from the mover's side, kept to 2 decimals; else None.
+    The game's own limit (eval_limit) is checked when the move is sent."""
+    if type(value) not in (int, float) or not math.isfinite(value) or not -limit <= value <= limit:
+        return None
+    value = round(float(value), 2)
+    return 0.0 if value == 0 else value
+
+
+def eval_limit(request):
+    """Playable squares of the game, the site's eval range: 64 on 8x8, 100 on 10x10, 88 on octagon (12 blocked squares)."""
+    n = request.get('board_size', 8)
+    return n * n - len(request.get('blocked_squares') or [])
+
+
+def nboard_eval(reply):
+    """The score of an NBoard reply "f5/1.5/0.3" (the mover's side, discs), or None."""
+    parts = reply.split()[0].split('/') if reply.split() else []
+    if len(parts) < 2:
+        return None
+    try:
+        return engine_eval(float(parts[1]))
+    except ValueError:
+        return None
 
 
 def square_index(text, n=8):
@@ -1046,7 +1074,10 @@ class NBoardEngine:
                 self._send('set game ' + ggf_position(request['board'], request['color']))
                 self._send('go')
                 reply = self._read_until(lambda t: t[3:].strip() if t.startswith('===') else None, deadline, cancel)
-                return square_index(reply.split()[0].split('/', 1)[0])  # NBoard may append score and elapsed time.
+                # NBoard may append score and elapsed time (=== f5/1.5/0.3). v1.5.3: the score goes with the move as eval.
+                move = square_index(reply.split()[0].split('/', 1)[0])
+                evaluation = nboard_eval(reply)
+                return move if evaluation is None else (move, evaluation)
             except BaseException:
                 self.stop()   # the only portable way to stop a search in NBoard
                 raise
@@ -1118,7 +1149,8 @@ class EdaxNBoardEngine(NBoardEngine):
                 move = square_index(reply.split()[0].split('/', 1)[0])
                 if move not in request['legal_moves']:
                     raise ValueError('Edax returned an illegal move')
-                return move
+                evaluation = nboard_eval(reply)   # v1.5.3
+                return move if evaluation is None else (move, evaluation)
             except BaseException:
                 self.stop()
                 raise
@@ -2114,6 +2146,12 @@ def main():
                     # the exact move with the same expected revision; never compute twice.
                     # Human matches (negative id) also need the room's round and creation time.
                     extra = {'round_no': key[3], 'room_created_at': key[4]} if key[0] < 0 else {}
+                    # v1.5.3: an engine answer with an eval comes as (move, eval). Only bot matches keep it on the site.
+                    evaluation = None
+                    if isinstance(move, tuple):
+                        move, evaluation = move
+                    if evaluation is not None and key[0] > 0 and abs(evaluation) <= eval_limit(request):
+                        extra['eval'] = evaluation
                     stamp(key, 'post')
                     # v1.5.1: wait at most a third of this leg's clock for the answer (1.5-8s), so a dead network path
                     # does not hold the other board for 8s.

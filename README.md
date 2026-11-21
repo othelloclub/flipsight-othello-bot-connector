@@ -15,6 +15,7 @@ It works with **Edax**, **Egaroucid**, any engine that speaks the **NBoard proto
 - **Moves get through (v1.4.4):** if the server answers a move with a temporary error (too many requests, 5xx, timeout or a dropped connection), the connector sends the same move again after 0.2 to 0.5 s while the game clock allows, and the log line shows the cause.
 - **Edax runs its own clock (v1.4.8):** `--edax` now connects over xboard. Edax decides its thinking time from both game clocks, keeps its game and hash table through the board, and can ponder with `--engine-ponder on`. `--edax-protocol nboard` keeps the older NBoard connection.
 - **Catches a stuck stream (v1.4.9):** if the event stream stays connected but goes silent for 15 s, the connector connects again and polls every second meanwhile. It also polls when its own move does not come back on the stream within 1 s, and more often when your clock is under 30 s, so a missed opponent move costs far less of a short clock than the regular 10 s poll.
+- **Sends your evaluation (v1.5.3):** a JSON engine may add `"eval"` (its evaluation after the move, in discs from its own side) and NBoard engines send the score of their `===` reply. In bot matches it goes with the move and shows in the game room. `--edax` (xboard) and `--egaroucid` do not send it yet.
 - **Keeps your games (v1.5.2):** `--save-games DIR` writes every finished game to `DIR/games-YYYY-MM.ndjson`, one JSON line per game (the server's game record: opponent, result, ratings, opening, both boards' moves with times). Games that ended while the connector was stopped or the stream was down are filled with `agent_games` when it reconnects. Off by default; about 4 KB per game (about 6 MB a day at 1,400 games).
 - **Faster recovery after a network blip (v1.5.1):** a move POST waits at most a third of that board's clock (1.5 to 8 s); after a timeout the HTTPS connection and the stream are opened again. A move refused with HTTP 409 (often because the first try did arrive) is dropped on its own while the other board goes on, and reconnects are merged (none while one is under way or within 3 s of the last). In a test where the network path stopped for 6 s, the first move after it came 0.3 s later instead of 3.4 s, and a 9 s slow answer no longer cost both boards.
 - **Fix of 2026-11-20 11:58 (UTC+9) in v1.5.0:** no reconnect for a quiet board while the opponent thinks (the earlier 1.5.0 reconnected after 2 to 4 s of quiet near the end of a game). It reconnects only when the stream is silent for 15 s, its own move is not echoed within 2 s, or the opponent's whole clock has passed with no news of that match.
@@ -126,6 +127,14 @@ python3 bot_match_client.py --engine-threads 2 --engine-ponder on --edax "edax/l
 
 日本語: v1.4.8から `--edax` は Edax を xboard 方式で起動します。毎手の前に双方の残り時間を送り、考える時間は Edax が決め、局の途中は棋譜とハッシュを引き継ぎます。`--engine-ponder on` なら相手の手番中も探索します。従来の接続は `--edax-protocol nboard` です。
 
+### Sending your evaluation (v1.5.3)
+
+v1.5.3 sends the evaluation your engine gives with each move in bot matches; it shows in the game room and stays in the game record. A JSON engine adds `"eval"` to its move reply (in discs from its own side), and an NBoard engine's `=== move/score/time` score is used as it is. The range is up to the playable squares (64 on 8x8, 100 on 10x10, 88 on octagon); without a value, or out of range, only the move is sent as before. `--edax` (xboard, the default) and `--egaroucid` do not send it yet in 1.5.3, and games against people never get it.
+
+한국어: v1.5.3 은 엔진이 보낸 평가치를 봇끼리 대국의 수와 함께 보내고, 게임방 칩과 그래프, 대국 기록에 남습니다. 직접 만든 JSON 엔진은 수 답에 `"eval"`(둔 뒤의 내 쪽 기준 돌 단위)을 넣고, NBoard 엔진은 `=== 수/점수/시간` 답의 점수를 그대로 씁니다. 범위는 둘 수 있는 칸 수(8x8 64, 10x10 100, 팔각 88)까지이고, 없거나 범위 밖이면 예전처럼 수만 보냅니다. `--edax` 기본(xboard)과 `--egaroucid` 는 1.5.3 에서 아직 보내지 않고, 사람과의 대국에도 보내지 않습니다.
+
+日本語: v1.5.3 はエンジンが返した評価値をボット同士の対局の手と一緒に送り、対局画面のチップとグラフ、対局記録に残します。自作の JSON エンジンは着手の返答に `"eval"`（打った後の自分側から見た石数）を入れ、NBoard エンジンは `=== 手/スコア/時間` 返答のスコアをそのまま使います。範囲は打てるマスの数（8x8 は 64、10x10 は 100、八角は 88）までで、ない場合や範囲外ならこれまでどおり手だけを送ります。`--edax` の既定（xboard）と `--egaroucid` は 1.5.3 ではまだ送らず、人との対局にも送りません。
+
 ### Saving game records (v1.5.2)
 
 `--save-games DIR` keeps every finished game in `DIR/games-YYYY-MM.ndjson` (one file per month), one game per line. Each line is the server's game record (JSON, `format` 1), the same object as the `record` of a finished match event and each line of `agent_games`: game ID, time, opponent name and ID, game type, colors, result (`void` for a technical void), discs, finish reason, ratings before and after, the opening, both boards' moves (`f5d6…`, `pa` for a pass, plus square numbers) and the time and remaining clock of every move. Games that ended while the connector was stopped or the stream was down are filled with `agent_games` on reconnecting, from the newest saved game (an empty folder starts now). A game that changes later (a technical void) gets one more line: the last line with the same `kind` and `id` is the current one. Filling uses its own HTTPS connection, so moves are not delayed. It is off by default: nothing is saved without the option. A game takes about 4 KB (about 6 KB on 10×10), so 1,400 games a day come to about 6 MB a day and about 180 MB a month; delete old month files yourself when you no longer need them. Optional update; the fields are described in the "Game records" section of the bot API docs.
@@ -191,6 +200,8 @@ Output (engine → connector), one line:
 {"move":19}
 ```
 `move` is a square index (`d3` = 19 on 8x8) or a coordinate such as `"d3"`. Send `-1` to pass when there is no legal move. Write nothing else to standard output.
+
+Optional (v1.5.3): `{"move":19,"eval":1.5}` adds your evaluation after the move, in discs from your side (+ means you are ahead). The connector sends it only in bot matches and only when it is a number within the playable squares (64 on 8x8, 100 on 10x10, 88 on octagon).
 
 The full field list, adapter examples for engines written in any language, and fixes for common problems are in the [bot API docs](https://othelloclub.com/en/flipsight/lab/api).
 
