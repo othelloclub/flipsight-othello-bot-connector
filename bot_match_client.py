@@ -59,6 +59,9 @@ full match event. Moves already known are skipped; a gap, an unknown match or bo
 known board or a game that is not standard 8x8 reconnects the stream to resync (within the usual limits), never a
 guess. The state, the first and the last event of a match, other changes, games against people and variants still
 come as full events, and a server without moves=1 keeps sending full events.
+Such a stream (2026-11-28) also leaves legal_moves out of every event, so the connector computes them for every game
+type by the server's rules (game_legal_moves: 10x10 grand and octagon, octagon's blocked squares, classic reversi's
+centre opening and 32-disc limit); a server value, when one comes, is still used as before.
 """
 import argparse
 import email.utils
@@ -1079,6 +1082,40 @@ def legal_moves(board, color):
     return result
 
 
+# v1.6.0 (2026-11-28): rules of the server's fsbm_legal_moves (othello_engine.lib.php oce_variant_geometry, oce_variant_play).
+OCTAGON_BLOCKED = frozenset(r * 10 + c for r, c in ((0, 0), (0, 1), (1, 0), (0, 8), (0, 9), (1, 9),
+                                                     (8, 0), (9, 0), (9, 1), (8, 9), (9, 8), (9, 9)))
+REVERSI_CENTER = (27, 28, 35, 36)   # d4 e4 d5 e5
+REVERSI_DISCS = 32                  # discs per player in classic reversi
+
+
+def game_legal_moves(board, color, mode='std', n=8, blocked=(), placed=None):
+    """v1.6.0: legal squares for color (1 black, 2 white) in any game type, for streams that leave legal_moves out.
+    std, anti and grand: a move must flip (grand is 10x10). octagon: 10x10 and its 12 blocked squares are never played
+    and stop a line like an empty square. reversi (classic): no move once that colour has placed its 32 discs; while any
+    of the four centre squares is empty, only those empty centre squares (placed without flipping)."""
+    if mode == 'reversi':
+        if isinstance(placed, dict) and type(placed.get(str(color))) is int and placed[str(color)] >= REVERSI_DISCS:
+            return []
+        if any(board[i] == 0 for i in REVERSI_CENTER):
+            return [i for i in REVERSI_CENTER if board[i] == 0]
+    shut = set(blocked or ()) | (OCTAGON_BLOCKED if mode == 'octagon' else set())
+    result = []
+    for square, cell in enumerate(board):
+        if cell or square in shut:
+            continue
+        row, col = divmod(square, n)
+        for dr, dc in DIRECTIONS:
+            r, c, captured = row + dr, col + dc, 0
+            while 0 <= r < n and 0 <= c < n and board[r * n + c] == 3 - color:
+                captured += 1
+                r, c = r + dr, c + dc
+            if captured and 0 <= r < n and 0 <= c < n and board[r * n + c] == color:
+                result.append(square)
+                break
+    return result
+
+
 def start_process(command, env):
     kwargs = dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, shell=False)
     if WINDOWS:
@@ -1776,7 +1813,8 @@ def current_turns(payload, my_id):
                 remaining = max(0, remaining - max(0, int(now - leg['turn_started_ms'])))
             key = (int(match['id']), leg_index, int(leg['revision']), match.get('round_no'), match.get('room_created_at'))
             legal=leg.get('legal_moves')
-            if legal is None and mode=='std':legal=legal_moves(board,color) # older server compatibility
+            if legal is None:   # v1.6.0: move-event streams leave legal_moves out (all game types); also older servers
+                legal=game_legal_moves(board,color,mode,n,state.get('blocked_squares',[]),leg.get('placed'))
             if not isinstance(legal,list) or any(type(v) is not int or not 0<=v<n*n or board[v]!=0 for v in legal):
                 raise ValueError('invalid legal moves received')
             turns[key] = {'board': board, 'color': color, 'legal_moves': legal, 'game_mode':mode,'board_size':n,
