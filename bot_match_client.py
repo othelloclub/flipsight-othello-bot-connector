@@ -48,6 +48,17 @@ that fail while the server restarts use the usual backoff. replaced means anothe
 opened a new stream: a warning is logged and the connector waits 30-60s before connecting again, so two copies no
 longer close each other every few seconds; from the 3rd time in 10 minutes the wait doubles each time up to 7.5-15
 minutes, and a connection that stays up 10 minutes clears the count. Unknown reasons reconnect as any other close.
+v1.6.0: the stream request says Accept-Encoding: gzip. A compressed stream (Content-Encoding: gzip, the server flushes
+every line) is read with read1, inflated and split into lines here, so each line is still handled the moment it
+arrives; without that header the stream is read as before, and the 15s silence rule is the same. The stream is opened
+with ?state=1&moves=1: a server that knows moves=1 says "moves": true in hello and, during standard 8x8 bot matches,
+sends each new move as a type "move" line (board, position in that board's history, coordinates a1..h8 or pass, turn,
+revision and clocks) instead of the whole match. The connector plays those moves on the last known board by the rules,
+rebuilds that match's view (history, board, legal moves, discs, turn, revision, clocks) and goes on exactly as with a
+full match event. Moves already known are skipped; a gap, an unknown match or board, a move that is not legal on the
+known board or a game that is not standard 8x8 reconnects the stream to resync (within the usual limits), never a
+guess. The state, the first and the last event of a match, other changes, games against people and variants still
+come as full events, and a server without moves=1 keeps sending full events.
 """
 import argparse
 import email.utils
@@ -74,8 +85,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 
-VERSION = '1.5.4'
+VERSION = '1.6.0'
 WINDOWS = os.name == 'nt'
 DIRECTIONS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 # Temporary errors during a game: the first FAST_RETRIES tries wait 0.2-0.5s, later ones back off 2, 4, ... 30s.
@@ -121,6 +133,11 @@ REPLACED_REPEAT = 3
 REPLACED_WINDOW_SEC = 600
 REPLACED_WAIT_MAX_SEC = 900.0
 REPLACED_CLEAR_SEC = 600
+# v1.6.0 (server 2026-11-28): a gzip stream is read in pieces of at most STREAM_READ_BYTES (read1 returns whatever has
+# arrived, it never waits for that much), and one inflated line may not exceed STREAM_LINE_MAX: a broken stream cannot
+# fill the memory (it is dropped and connected again like any other failed connection).
+STREAM_READ_BYTES = 65536
+STREAM_LINE_MAX = 16 * 1024 * 1024
 MOVE_POST_TIMEOUT_MIN, MOVE_POST_TIMEOUT_MAX = 1.5, 8.0
 ENV_REPORT_EVERY_SEC = 30
 SAFETY_POLL_GAME_SEC = 60   # v1.5.0 (bot API v2): 60s; the waiting-leg polls still cover a quiet board after 10s
@@ -493,6 +510,50 @@ def closing_reason(value):
     return ''.join(c for c in text[:40] if c.isascii() and (c.isalnum() or c in '_-.')) or '?'
 
 
+def stream_lines(response):
+    """v1.6.0: the lines of a stream response. Without Content-Encoding the response itself is read line by line, as
+    before. With gzip see gzip_lines. Another encoding (never asked for) fails the connection."""
+    encoding = (response.headers.get('Content-Encoding') or '').strip().lower()
+    if encoding in ('', 'identity'):
+        return response
+    if encoding != 'gzip':
+        raise ValueError('unsupported stream encoding')
+    return gzip_lines(response)
+
+
+def gzip_lines(response):
+    """v1.6.0: lines of a gzip stream as they arrive. The server compresses every line and flushes it at once
+    (Z_SYNC_FLUSH), so read1 (one read: whatever has arrived, never waiting for more) brings whole lines; they are
+    inflated and split here and each is yielded at once. The socket timeout (STREAM_SILENCE_SEC) still ends a silent
+    read. A line longer than STREAM_LINE_MAX or a broken gzip stream fails the connection. A chunked answer cut off
+    without its last chunk ends like a plain stream does (the line reader ends quietly there too)."""
+    inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    pending = bytearray()
+    while not inflater.eof:
+        try:
+            data = response.read1(STREAM_READ_BYTES)
+        except http.client.IncompleteRead:
+            data = b''
+        if not data:
+            pending += inflater.flush()
+            break   # the server closed the connection (or a reconnect shut the socket down)
+        while data:
+            pending += inflater.decompress(data, STREAM_LINE_MAX)
+            data = inflater.unconsumed_tail
+            start = 0
+            while True:
+                end = pending.find(b'\n', start)
+                if end < 0:
+                    break
+                yield bytes(pending[start:end])
+                start = end + 1
+            del pending[:start]
+            if len(pending) > STREAM_LINE_MAX:
+                raise ValueError('stream line too long')
+    if pending:
+        yield bytes(pending)   # a last line without its newline, as a plain stream gives it
+
+
 class EventStream(threading.Thread):
     """Reads NDJSON events, hands hello and match events to the main loop (events queue) and wakes it.
 
@@ -501,7 +562,10 @@ class EventStream(threading.Thread):
     main loop, and the reader connects again. Drops, failed tries and reconnects are logged (never the token).
 
     v1.5.4: a "closing" line ends the connection at once. overflow and server_shutdown reconnect after 0.2s (as a
-    resync), replaced waits replaced_wait() seconds, and any other reason goes the usual way (backoff)."""
+    resync), replaced waits replaced_wait() seconds, and any other reason goes the usual way (backoff).
+
+    v1.6.0: asks for gzip (stream_lines reads either form) and hands "move" lines to the main loop like match events.
+    The connect line says when the stream is compressed and when hello announced move events."""
 
     def __init__(self, url, token, wake, events=None):
         super().__init__(daemon=True)
@@ -570,11 +634,14 @@ class EventStream(threading.Thread):
             closing, connected_at = None, None   # v1.5.4: reason of the server's closing line; local time of hello
             self.silenced = False
             try:
-                request = urllib.request.Request(self.url, headers={'Authorization': 'Bearer ' + self.token, 'Accept': 'application/x-ndjson'})
+                # v1.6.0: gzip is welcome; stream_lines reads a compressed and a plain answer alike.
+                request = urllib.request.Request(self.url, headers={'Authorization': 'Bearer ' + self.token, 'Accept': 'application/x-ndjson',
+                                                                    'Accept-Encoding': 'gzip'})
                 # The server sends a ping every 10s, so STREAM_SILENCE_SEC without data means the stream is stuck.
                 with self.opener.open(request, timeout=STREAM_SILENCE_SEC) as response:
                     self.response = response
-                    for raw in response:
+                    packed = (response.headers.get('Content-Encoding') or '').strip().lower() == 'gzip'
+                    for raw in stream_lines(response):
                         self.last_line = time.monotonic()
                         if self.stopping.is_set():
                             return
@@ -586,10 +653,13 @@ class EventStream(threading.Thread):
                             continue
                         if event.get('type') == 'hello':
                             if not connected:
+                                # v1.6.0: say so when the stream is compressed or carries move events (nothing added otherwise).
+                                details = [name for name, on in (('gzip', packed), ('move events', event.get('moves') is True)) if on]
+                                details = ' (%s)' % ', '.join(details) if details else ''
                                 if ever_connected:
-                                    log('Event stream reconnected after %.1fs.' % (time.monotonic() - (down_since or self.last_line)))
+                                    log('Event stream reconnected after %.1fs%s.' % (time.monotonic() - (down_since or self.last_line), details))
                                 else:
-                                    log('Event stream connected.')
+                                    log('Event stream connected%s.' % details)
                                 connected, ever_connected, down_since = True, True, None
                                 connected_at = self.last_line
                             self.healthy, backoff = True, 1.0
@@ -599,7 +669,7 @@ class EventStream(threading.Thread):
                                 event['_received'] = self.last_line
                                 self.events.put(event)
                             self.wake.set()
-                        elif event.get('type') in ('match', 'state'):
+                        elif event.get('type') in ('match', 'state', 'move'):   # v1.6.0: move lines too
                             if self.events is not None:
                                 event['_received'] = self.last_line   # for --timing-log and late-event lines
                                 self.events.put(event)
@@ -707,6 +777,105 @@ def apply_stream_event(base, event):
     if base is None or event.get('type') != 'match' or event.get('view') != 'agent':
         return False
     return fold_match(base, event.get('match'))
+
+
+def move_square(text):
+    """v1.6.0: square index of a move event coordinate (a1..h8, row-major from a1 = 0, as the history and board of full
+    events), -1 for "pass", None for anything else."""
+    if not isinstance(text, str):
+        return None
+    text = text.lower()
+    if text == 'pass':
+        return -1
+    if len(text) != 2 or text[0] not in 'abcdefgh' or text[1] not in '12345678':
+        return None
+    return (int(text[1]) - 1) * 8 + 'abcdefgh'.index(text[0])
+
+
+def apply_move_event(base, event):
+    """v1.6.0: this bot's view of a match after a stream "move" event (a stream opened with moves=1, standard 8x8 bot
+    matches only): the new moves of one board (leg) from position index of its history, and that board's turn, revision,
+    clocks_ms and turn_started_ms after them, which mean the same as in a full match and replace them.
+
+    Returns (match, None) with the new view, built from the last known one: the moves are played on the known board by
+    the rules (colour = side to move before the move, participant = the one playing that colour on that board, -1 for a
+    pass), and board, history, legal_moves, discs and placed follow from them. Fields the event does not carry (the
+    match's own revision, totals, at_ms of the new entries) stay as they were; "auto" is not set (the event does not
+    say). The known view is never changed in place (running searches still hold its lists).
+    Returns (None, None) when every move is known already (a duplicate), and (None, reason) when only a resync can
+    tell: no state yet, an unknown match or board, a gap (index past the known history), a known move that differs, a
+    move that is not legal on the known board, a turn that does not follow, a game that is not a running standard 8x8
+    bot match, or an event without the expected fields. Nothing is guessed."""
+    match_id, leg_index, index, moves = (event.get(k) for k in ('match_id', 'leg', 'index', 'moves'))
+    turn, revision, clocks, started = (event.get(k) for k in ('turn', 'revision', 'clocks_ms', 'turn_started_ms'))
+    if (event.get('view') != 'agent' or type(match_id) is not int or type(leg_index) is not int or type(index) is not int
+            or index < 0 or not isinstance(moves, list) or not moves or type(turn) is not int or turn not in (1, 2)
+            or type(revision) is not int or not isinstance(clocks, list) or len(clocks) != 2
+            or any(type(c) not in (int, float) for c in clocks) or type(started) not in (int, float)):
+        return None, 'a move event without the expected fields'
+    where = 'match %s leg %s' % (match_id, leg_index)
+    squares = [move_square(m) for m in moves]
+    if None in squares:
+        return None, '%s: unreadable move in a move event' % where
+    matches = base.get('matches') if isinstance(base, dict) else None
+    match = next((m for m in matches if isinstance(m, dict) and m.get('id') == match_id), None) if isinstance(matches, list) else None
+    if match is None:
+        return None, 'move event for unknown match %s' % match_id
+    state = match.get('state')
+    if match_id <= 0 or match.get('status') != 'running' or not isinstance(state, dict) or state.get('version') != 1:
+        return None, '%s: move event for a match that is not a running bot match' % where
+    if (state.get('game_mode', match.get('game_mode', 'std')) != 'std' or state.get('board_size', 8) != 8
+            or state.get('blocked_squares')):
+        return None, '%s: move event for a game that is not standard 8x8' % where
+    legs = state.get('legs')
+    leg = legs[leg_index] if isinstance(legs, list) and 0 <= leg_index < len(legs) else None
+    if not isinstance(leg, dict):
+        return None, '%s: move event for an unknown board' % where
+    history, board, color = leg.get('history'), leg.get('board'), leg.get('turn')
+    if (leg.get('status') not in ('running', 'playing', 'active') or not isinstance(history, list)
+            or not isinstance(board, list) or len(board) != 64 or any(type(x) is not int or x not in (0, 1, 2) for x in board)
+            or type(color) is not int or color not in (1, 2)):
+        return None, '%s: move event for a board that is not in play' % where
+    known = len(history)
+    if index > known:
+        return None, '%s: moves missing (event from entry %d, %d known)' % (where, index, known)
+    overlap = known - index
+    for offset in range(min(overlap, len(squares))):
+        entry = history[index + offset]
+        if not isinstance(entry, dict) or entry.get('move') != squares[offset]:
+            return None, '%s: move event differs from the known history at entry %d' % (where, index + offset)
+    new = squares[overlap:]
+    if not new:
+        return None, None   # all known already (a repeated line)
+    if type(leg.get('revision')) is int and revision < leg['revision']:
+        return None, '%s: move event revision %d below the known %d' % (where, revision, leg['revision'])
+    black = leg.get('black_participant')
+    if type(black) is not int or black not in (0, 1):
+        black = leg_index   # as current_turns: participant 0 (bot_a) is black on board 0 and white on board 1
+    placed = leg.get('placed')
+    placed = dict(placed) if isinstance(placed, dict) and all(type(placed.get(k)) is int for k in ('1', '2')) else None
+    board, added = list(board), []
+    for offset, square in enumerate(new, overlap):
+        legal = legal_moves(board, color)
+        if square == -1 and legal:
+            return None, '%s: pass at entry %d while moves exist on the known board' % (where, index + offset)
+        if square != -1:
+            if square not in legal:
+                return None, '%s: move %s at entry %d is not legal on the known board' % (where, moves[offset], index + offset)
+            board = play_square(board, color, square)
+            if placed is not None:
+                placed[str(color)] += 1
+        added.append({'color': color, 'participant': black if color == 1 else 1 - black, 'move': square})
+        color = 3 - color
+    if color != turn:
+        return None, '%s: move event turn %d does not follow from its moves' % (where, turn)
+    fresh = dict(leg, board=board, turn=turn, revision=revision, clocks_ms=list(clocks), turn_started_ms=started,
+                 history=history + added, legal_moves=legal_moves(board, turn), discs=[board.count(1), board.count(2)])
+    if placed is not None:
+        fresh['placed'] = placed
+    legs = list(legs)
+    legs[leg_index] = fresh
+    return dict(match, state=dict(state, legs=legs)), None
 
 
 def merge_state(base, state):
@@ -1878,7 +2047,9 @@ def main():
                 raise ValueError('stream URL must be on the API host')
             # v1.4.10: ask for the state after hello and for this bot's view in every event. A server that does not
             # know the parameter ignores it (its hello has no state_follows) and the connector polls as before.
-            stream_url += '?state=1'
+            # v1.6.0: moves=1 asks for move events on standard boards (apply_move_event); a server that does not know
+            # it says nothing of moves in hello and keeps sending full match events, which work as before.
+            stream_url += '?state=1&moves=1'
     except ValueError as error:
         parser.error(str(error))
 
@@ -2023,6 +2194,7 @@ def main():
                 return 2
             try:
                 late = []   # (lag ms, match id) of stream events that arrived more than EVENT_LATE_MS after they were sent
+                move_problems = []   # v1.6.0: move events that need a resync; a state later in this round answers them
                 while True:
                     try:
                         event = events.get_nowait()
@@ -2047,6 +2219,7 @@ def main():
                             continue
                         base = merge_state(base, event)
                         poll_now = False
+                        del move_problems[:]   # v1.6.0: the fresh state covers what those move events missed
                         if filler is not None:
                             filler.request()   # v1.5.2: after (re)connecting, fill games that ended while the stream was down
                         if last_poll is not None:   # the first poll at start still goes out: it reports the environment
@@ -2058,6 +2231,17 @@ def main():
                             if isinstance(state_match, dict) and state_match.get('status') == 'running':
                                 seen[state_match.get('id')] = ('state', received)
                         continue
+                    if event.get('type') == 'move':
+                        # v1.6.0: new moves of one standard board. Rebuild that match's view from the last known one and
+                        # go on below exactly as with a full match event (same server_now_ms and receive time). Moves
+                        # already known are skipped; anything that does not fit resyncs (reconnect, full state again).
+                        rebuilt, problem = apply_move_event(base, event)
+                        if rebuilt is None:
+                            if problem is not None and problem not in move_problems:
+                                move_problems.append(problem)
+                            continue
+                        event = {'type': 'match', 'view': 'agent', 'match': rebuilt,
+                                 'server_now_ms': event.get('server_now_ms'), '_received': received}
                     if event.get('type') == 'match':
                         lag = stream_lag_ms(event.get('server_now_ms'), event.get('_received'), poll_clock)
                         if lag is not None and lag > EVENT_LATE_MS:
@@ -2083,6 +2267,7 @@ def main():
                             server_clock = (now_ms, time.monotonic())
                     else:
                         poll_now = True
+                resync_asks.extend(p for p in move_problems if p not in resync_asks)   # v1.6.0
                 if late:
                     log('%d stream event(s) arrived late, up to %.1fs after the server sent them (match %s).'
                         % (len(late), max(lag for lag, _ in late) / 1000, ', '.join(sorted({str(m) for _, m in late}))))

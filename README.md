@@ -15,6 +15,7 @@ It works with **Edax**, **Egaroucid**, any engine that speaks the **NBoard proto
 - **Moves get through (v1.4.4):** if the server answers a move with a temporary error (too many requests, 5xx, timeout or a dropped connection), the connector sends the same move again after 0.2 to 0.5 s while the game clock allows, and the log line shows the cause.
 - **Edax runs its own clock (v1.4.8):** `--edax` now connects over xboard. Edax decides its thinking time from both game clocks, keeps its game and hash table through the board, and can ponder with `--engine-ponder on`. `--edax-protocol nboard` keeps the older NBoard connection.
 - **Catches a stuck stream (v1.4.9):** if the event stream stays connected but goes silent for 15 s, the connector connects again and polls every second meanwhile. It also polls when its own move does not come back on the stream within 1 s, and more often when your clock is under 30 s, so a missed opponent move costs far less of a short clock than the regular 10 s poll.
+- **Only new moves during a game (v1.6.0):** during standard 8x8 bot matches the server sends just the new move's coordinates and both clocks, and the connector plays them on the board it knows, so much less data comes down the stream. If a move is missing or does not fit the board, it reconnects and gets the whole state again. The stream is opened with `?state=1&moves=1`, so a bot registered before this change switches after one connection.
 - **Handles the server's closing notice (v1.5.4):** after `overflow` or `server_shutdown` the connector connects again at once. After `replaced` (the same bot token runs somewhere else) it logs a warning and waits 30 to 60 s, longer when it repeats, so two copies no longer close each other every few seconds.
 - **Sends your evaluation (v1.5.3):** in bot matches the engine's evaluation goes with the move and shows in the game room. `--edax`, `--egaroucid` and NBoard engines send it by themselves from v1.5.3. A custom JSON adapter adds `"eval"` (its evaluation after the move, in discs from its own side).
 - **Keeps your games (v1.5.2):** `--save-games DIR` writes every finished game to `DIR/games-YYYY-MM.ndjson`, one JSON line per game (the server's game record: opponent, result, ratings, opening, both boards' moves with times). Games that ended while the connector was stopped or the stream was down are filled with `agent_games` when it reconnects. Off by default; about 4 KB per game (about 6 MB a day at 1,400 games).
@@ -127,6 +128,20 @@ python3 bot_match_client.py --engine-threads 2 --engine-ponder on --edax "edax/l
 한국어: v1.4.8부터 `--edax`는 Edax를 xboard 방식으로 실행합니다. 매 수 전에 양쪽 남은 시간을 보내고 생각할 시간은 Edax가 정하며, 판 안에서는 기보와 해시를 이어 씁니다. `--engine-ponder on`이면 상대 차례에도 탐색합니다. 예전 연결은 `--edax-protocol nboard`입니다.
 
 日本語: v1.4.8から `--edax` は Edax を xboard 方式で起動します。毎手の前に双方の残り時間を送り、考える時間は Edax が決め、局の途中は棋譜とハッシュを引き継ぎます。`--engine-ponder on` なら相手の手番中も探索します。従来の接続は `--edax-protocol nboard` です。
+
+### Move events (v1.6.0)
+
+v1.6.0 opens the event stream with `?state=1&moves=1`. During standard 8x8 bot matches the server then sends a `move` line with only the new moves (coordinates such as `f5`, or `pass`), the turn and both clocks. The connector plays those moves on the board it knows, by the rules, and skips moves it already has. If a move is missing or is not legal on that board, it does not guess: it reconnects the stream and gets the whole state again.
+
+The whole match still comes when the stream connects and when a match starts or ends. Games against people and variant games come whole as before. New bots get move events by default. A bot registered earlier switches after one connection with `moves=1`, which v1.6.0 adds for you. Once connected, the connect line in the log ends with `(move events)`.
+
+한국어: v1.6.0 은 이벤트 스트림을 `?state=1&moves=1` 로 엽니다. 그러면 일반 8x8 봇 대국 중에는 서버가 새 수의 좌표(패스는 `pass`)와 차례, 두 시계만 담은 `move` 줄을 보냅니다. 연결기는 그 수를 알던 판에 규칙대로 두고, 이미 받은 수는 건너뜁니다. 수가 빠졌거나 그 판에 둘 수 없는 수면 짐작하지 않고, 스트림을 다시 연결해 전체 상태를 받습니다.
+
+연결할 때와 대국이 시작하거나 끝날 때는 대국 전체가 옵니다. 사람과의 대국과 변형 게임도 예전처럼 대국 전체로 옵니다. 새 봇은 처음부터 좌표 방식입니다. 예전에 등록한 봇은 `moves=1` 로 한 번 연결하면 바뀌고, v1.6.0 이 이것을 대신 붙입니다. 연결되면 기록의 연결 줄 끝에 `(move events)` 가 붙습니다.
+
+日本語: v1.6.0 はイベントストリームを `?state=1&moves=1` で開きます。すると通常の 8x8 ボット対局中は、サーバーが新しい手の座標（パスは `pass`）、手番、双方の持ち時間だけを入れた `move` 行を送ります。接続プログラムはその手を手元の盤にルールどおりに打ち、受け取り済みの手は飛ばします。手が抜けていたり、その盤に打てない手だったりしたら推測せず、ストリームを接続し直して状態全体を受け取ります。
+
+接続したときと、対局の開始と終了のときは対局全体が届きます。人との対局と変則ゲームも今までどおり対局全体で届きます。新しいボットは最初から座標方式です。以前に登録したボットは `moves=1` で1回接続すれば切り替わり、v1.6.0 がこれを代わりに付けます。つながるとログの接続行の最後に `(move events)` が付きます。
 
 ### Server closing notice (v1.5.4)
 
